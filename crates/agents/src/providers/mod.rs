@@ -217,24 +217,55 @@ impl ProviderRegistry {
             return;
         }
 
-        let model_id = config
+        // All available Codex models, matching the Codex CLI model picker.
+        let codex_models: &[(&str, &str)] = &[
+            ("gpt-5.2-codex", "GPT-5.2 Codex"),
+            ("gpt-5.2", "GPT-5.2"),
+            ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
+            ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
+        ];
+
+        // If user configured a specific model, register only that one.
+        if let Some(model_id) = config
             .get("openai-codex")
             .and_then(|e| e.model.as_deref())
-            .unwrap_or("gpt-5.2");
-
-        if self.providers.contains_key(model_id) {
+        {
+            if !self.providers.contains_key(model_id) {
+                let display_name = codex_models
+                    .iter()
+                    .find(|(id, _)| *id == model_id)
+                    .map(|(_, name)| format!("{name} (Codex/OAuth)"))
+                    .unwrap_or_else(|| format!("{model_id} (Codex/OAuth)"));
+                let provider =
+                    Arc::new(openai_codex::OpenAiCodexProvider::new(model_id.into()));
+                self.register(
+                    ModelInfo {
+                        id: model_id.into(),
+                        provider: "openai-codex".into(),
+                        display_name,
+                    },
+                    provider,
+                );
+            }
             return;
         }
 
-        let provider = Arc::new(openai_codex::OpenAiCodexProvider::new(model_id.into()));
-        self.register(
-            ModelInfo {
-                id: model_id.into(),
-                provider: "openai-codex".into(),
-                display_name: "GPT-5.2 (Codex/OAuth)".into(),
-            },
-            provider,
-        );
+        // No specific model configured — register all available Codex models.
+        for &(model_id, display_name) in codex_models {
+            if self.providers.contains_key(model_id) {
+                continue;
+            }
+            let provider =
+                Arc::new(openai_codex::OpenAiCodexProvider::new(model_id.into()));
+            self.register(
+                ModelInfo {
+                    id: model_id.into(),
+                    provider: "openai-codex".into(),
+                    display_name: format!("{display_name} (Codex/OAuth)"),
+                },
+                provider,
+            );
+        }
     }
 
     fn register_builtin_providers(&mut self, config: &ProvidersConfig) {
