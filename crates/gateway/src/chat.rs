@@ -168,10 +168,18 @@ impl ChatService for LiveChatService {
                 entry.project_id.clone()
             });
             if let Some(pid) = project_id {
-                match self.state.services.project.get(serde_json::json!({"id": pid})).await {
+                match self
+                    .state
+                    .services
+                    .project
+                    .get(serde_json::json!({"id": pid}))
+                    .await
+                {
                     Ok(val) => {
                         if let Some(dir) = val.get("directory").and_then(|v| v.as_str()) {
-                            match moltis_projects::context::load_context_files(std::path::Path::new(dir)) {
+                            match moltis_projects::context::load_context_files(
+                                std::path::Path::new(dir),
+                            ) {
                                 Ok(files) => {
                                     let project: Option<moltis_projects::Project> =
                                         serde_json::from_value(val.clone()).ok();
@@ -185,16 +193,16 @@ impl ChatService for LiveChatService {
                                     } else {
                                         None
                                     }
-                                }
+                                },
                                 Err(e) => {
                                     warn!("failed to load project context: {e}");
                                     None
-                                }
+                                },
                             }
                         } else {
                             None
                         }
-                    }
+                    },
                     Err(_) => None,
                 }
             } else {
@@ -289,8 +297,7 @@ impl ChatService for LiveChatService {
 
             // Persist assistant response.
             if let Some(response_text) = assistant_text {
-                let assistant_msg =
-                    serde_json::json!({"role": "assistant", "content": response_text, "model": model_id, "provider": provider_name});
+                let assistant_msg = serde_json::json!({"role": "assistant", "content": response_text, "model": model_id, "provider": provider_name});
                 if let Err(e) = session_store
                     .append(&session_key_clone, &assistant_msg)
                     .await

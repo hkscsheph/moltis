@@ -174,11 +174,14 @@ impl GitHubCopilotProvider {
         let copilot_resp: CopilotTokenResponse = resp.json().await?;
 
         // Cache the Copilot API token
-        let _ = self.token_store.save("github-copilot-api", &OAuthTokens {
-            access_token: copilot_resp.token.clone(),
-            refresh_token: None,
-            expires_at: Some(copilot_resp.expires_at),
-        });
+        let _ = self.token_store.save(
+            "github-copilot-api",
+            &OAuthTokens {
+                access_token: copilot_resp.token.clone(),
+                refresh_token: None,
+                expires_at: Some(copilot_resp.expires_at),
+            },
+        );
 
         Ok(copilot_resp.token)
     }

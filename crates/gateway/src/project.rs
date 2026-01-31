@@ -3,9 +3,7 @@ use std::sync::Arc;
 use {async_trait::async_trait, serde_json::Value, tokio::sync::RwLock, tracing::warn};
 
 use moltis_projects::{
-    ProjectStore, TomlProjectStore,
-    complete::complete_path,
-    context::load_context_files,
+    ProjectStore, TomlProjectStore, complete::complete_path, context::load_context_files,
     detect::auto_detect,
 };
 
@@ -45,7 +43,10 @@ impl ProjectService for LiveProjectService {
         let project: moltis_projects::Project =
             serde_json::from_value(params).map_err(|e| e.to_string())?;
         let store = self.store.read().await;
-        store.upsert(project.clone()).await.map_err(|e| e.to_string())?;
+        store
+            .upsert(project.clone())
+            .await
+            .map_err(|e| e.to_string())?;
         serde_json::to_value(project).map_err(|e| e.to_string())
     }
 
@@ -84,10 +85,7 @@ impl ProjectService for LiveProjectService {
     }
 
     async fn complete_path(&self, params: Value) -> ServiceResult {
-        let partial = params
-            .get("partial")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let partial = params.get("partial").and_then(|v| v.as_str()).unwrap_or("");
         let results: Vec<String> = complete_path(partial)
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())

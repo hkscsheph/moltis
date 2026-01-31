@@ -121,14 +121,14 @@ impl WorktreeManager {
             match output {
                 Ok(o) if o.status.success() => {
                     debug!(branch = %branch, "deleted local branch");
-                }
+                },
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     debug!(branch = %branch, stderr = %stderr, "branch delete skipped");
-                }
+                },
                 Err(e) => {
                     warn!(branch = %branch, error = %e, "failed to delete branch");
-                }
+                },
             }
         }
 

@@ -142,7 +142,7 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
             Err(e) => {
                 tracing::warn!("cron file store unavailable ({e}), using in-memory");
                 Arc::new(moltis_cron::store_memory::InMemoryStore::new())
-            }
+            },
         };
 
     // Deferred reference: populated once GatewayState is ready.
@@ -185,11 +185,8 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         })
     });
 
-    let cron_service = moltis_cron::service::CronService::new(
-        cron_store,
-        on_system_event,
-        on_agent_turn,
-    );
+    let cron_service =
+        moltis_cron::service::CronService::new(cron_store, on_system_event, on_agent_turn);
 
     // Wire cron into gateway services.
     let live_cron = Arc::new(crate::cron::LiveCronService::new(Arc::clone(&cron_service)));
