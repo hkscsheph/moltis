@@ -9,7 +9,7 @@ use {
     tracing::{debug, error, info, warn},
 };
 
-use moltis_channels::message_log::MessageLog;
+use moltis_channels::{ChannelEventSink, message_log::MessageLog};
 
 use crate::{
     config::TelegramAccountConfig,
@@ -27,6 +27,7 @@ pub async fn start_polling(
     config: TelegramAccountConfig,
     accounts: AccountStateMap,
     message_log: Option<Arc<dyn MessageLog>>,
+    event_sink: Option<Arc<dyn ChannelEventSink>>,
 ) -> anyhow::Result<CancellationToken> {
     // Build bot with a client timeout longer than the long-polling timeout (30s)
     // so the HTTP client doesn't abort the request before Telegram responds.
@@ -62,6 +63,7 @@ pub async fn start_polling(
         outbound,
         cancel: cancel.clone(),
         message_log,
+        event_sink,
     };
 
     {

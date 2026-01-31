@@ -5,7 +5,7 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use moltis_channels::message_log::MessageLog;
+use moltis_channels::{ChannelEventSink, message_log::MessageLog};
 
 use crate::{config::TelegramAccountConfig, outbound::TelegramOutbound};
 
@@ -21,4 +21,5 @@ pub struct AccountState {
     pub outbound: Arc<TelegramOutbound>,
     pub cancel: CancellationToken,
     pub message_log: Option<Arc<dyn MessageLog>>,
+    pub event_sink: Option<Arc<dyn ChannelEventSink>>,
 }

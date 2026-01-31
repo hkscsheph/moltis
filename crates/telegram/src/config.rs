@@ -41,6 +41,11 @@ pub struct TelegramAccountConfig {
 
     /// Minimum interval between edit-in-place updates (ms).
     pub edit_throttle_ms: u64,
+
+    /// Default model ID for this bot's sessions (e.g. "openai/gpt-4o").
+    /// When set, channel messages use this model instead of the first registered provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Default for TelegramAccountConfig {
@@ -54,6 +59,7 @@ impl Default for TelegramAccountConfig {
             group_allowlist: Vec::new(),
             stream_mode: StreamMode::default(),
             edit_throttle_ms: 300,
+            model: None,
         }
     }
 }

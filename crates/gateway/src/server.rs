@@ -317,8 +317,12 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         let channel_store: Arc<dyn ChannelStore> =
             Arc::new(crate::channel_store::SqliteChannelStore::new(db_pool.clone()));
 
-        let mut tg_plugin =
-            moltis_telegram::TelegramPlugin::new().with_message_log(Arc::clone(&message_log));
+        let channel_sink = Arc::new(crate::channel_events::GatewayChannelEventSink::new(
+            Arc::clone(&deferred_state),
+        ));
+        let mut tg_plugin = moltis_telegram::TelegramPlugin::new()
+            .with_message_log(Arc::clone(&message_log))
+            .with_event_sink(channel_sink);
 
         // Start channels from config file (these take precedence).
         let tg_accounts = &config.channels.telegram;
@@ -365,8 +369,16 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         if !started.is_empty() {
             info!("{} telegram account(s) started", started.len());
         }
-        services.channel =
-            Arc::new(crate::channel::LiveChannelService::new(tg_plugin, channel_store));
+
+        // Grab shared outbound before moving tg_plugin into the channel service.
+        let tg_outbound = tg_plugin.shared_outbound();
+        services = services.with_channel_outbound(tg_outbound);
+
+        services.channel = Arc::new(crate::channel::LiveChannelService::new(
+            tg_plugin,
+            channel_store,
+            Arc::clone(&message_log),
+        ));
     }
 
     let state = GatewayState::with_sandbox_router(

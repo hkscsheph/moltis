@@ -11,6 +11,7 @@ use {
 };
 
 use moltis_channels::{
+    ChannelEventSink,
     message_log::MessageLog,
     plugin::{ChannelHealthSnapshot, ChannelOutbound, ChannelPlugin, ChannelStatus},
 };
@@ -24,6 +25,7 @@ pub struct TelegramPlugin {
     accounts: AccountStateMap,
     outbound: TelegramOutbound,
     message_log: Option<Arc<dyn MessageLog>>,
+    event_sink: Option<Arc<dyn ChannelEventSink>>,
 }
 
 impl TelegramPlugin {
@@ -36,12 +38,25 @@ impl TelegramPlugin {
             accounts,
             outbound,
             message_log: None,
+            event_sink: None,
         }
     }
 
     pub fn with_message_log(mut self, log: Arc<dyn MessageLog>) -> Self {
         self.message_log = Some(log);
         self
+    }
+
+    pub fn with_event_sink(mut self, sink: Arc<dyn ChannelEventSink>) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Get a shared reference to the outbound sender (for use outside the plugin).
+    pub fn shared_outbound(&self) -> Arc<dyn moltis_channels::ChannelOutbound> {
+        Arc::new(TelegramOutbound {
+            accounts: Arc::clone(&self.accounts),
+        })
     }
 
     /// List all active account IDs.
@@ -89,6 +104,7 @@ impl ChannelPlugin for TelegramPlugin {
             tg_config,
             Arc::clone(&self.accounts),
             self.message_log.clone(),
+            self.event_sink.clone(),
         )
         .await?;
 

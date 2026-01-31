@@ -57,6 +57,13 @@ impl ChannelOutbound for TelegramOutbound {
         Ok(())
     }
 
+    async fn send_typing(&self, account_id: &str, to: &str) -> Result<()> {
+        let bot = self.get_bot(account_id)?;
+        let chat_id = ChatId(to.parse::<i64>()?);
+        let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
+        Ok(())
+    }
+
     async fn send_media(&self, account_id: &str, to: &str, payload: &ReplyPayload) -> Result<()> {
         let bot = self.get_bot(account_id)?;
         let chat_id = ChatId(to.parse::<i64>()?);

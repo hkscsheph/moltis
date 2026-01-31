@@ -119,13 +119,32 @@ impl ChatService for LiveChatService {
             .get("_conn_id")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let model_id = params.get("model").and_then(|v| v.as_str());
+        let explicit_model = params.get("model").and_then(|v| v.as_str());
         // Use streaming-only mode if explicitly requested or if no tools are registered.
         let stream_only = params
             .get("stream_only")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
             || !self.has_tools();
+
+        // Resolve session key: explicit override (used by cron callbacks) or
+        // connection-scoped lookup.
+        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
+            sk.to_string()
+        } else {
+            self.session_key_for(conn_id.as_deref()).await
+        };
+
+        // Resolve model: explicit param → session metadata → first registered.
+        let session_model = if explicit_model.is_none() {
+            self.session_metadata
+                .get(&session_key)
+                .await
+                .and_then(|e| e.model)
+        } else {
+            None
+        };
+        let model_id = explicit_model.or(session_model.as_deref());
 
         let provider = {
             let reg = self.providers.read().await;
@@ -142,14 +161,6 @@ impl ChatService for LiveChatService {
                 reg.first()
                     .ok_or_else(|| "no LLM providers configured".to_string())?
             }
-        };
-
-        // Resolve session key: explicit override (used by cron callbacks) or
-        // connection-scoped lookup.
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            self.session_key_for(conn_id.as_deref()).await
         };
 
         // Resolve project context for this connection's active project.
@@ -228,8 +239,12 @@ impl ChatService for LiveChatService {
             }
         };
 
-        // Persist the user message.
-        let user_msg = serde_json::json!({"role": "user", "content": &text});
+        // Persist the user message (with optional channel metadata for UI display).
+        let channel_meta = params.get("channel").cloned();
+        let mut user_msg = serde_json::json!({"role": "user", "content": &text});
+        if let Some(ch) = &channel_meta {
+            user_msg["channel"] = ch.clone();
+        }
         if let Err(e) = self.session_store.append(&session_key, &user_msg).await {
             warn!("failed to persist user message: {e}");
         }
@@ -469,11 +484,12 @@ impl ChatService for LiveChatService {
     }
 
     async fn clear(&self, params: Value) -> ServiceResult {
-        let conn_id = params
-            .get("_conn_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_key = self.session_key_for(conn_id.as_deref()).await;
+        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
+            sk.to_string()
+        } else {
+            let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
+            self.session_key_for(conn_id.as_deref()).await
+        };
 
         self.session_store
             .clear(&session_key)
@@ -488,11 +504,12 @@ impl ChatService for LiveChatService {
     }
 
     async fn compact(&self, params: Value) -> ServiceResult {
-        let conn_id = params
-            .get("_conn_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_key = self.session_key_for(conn_id.as_deref()).await;
+        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
+            sk.to_string()
+        } else {
+            let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
+            self.session_key_for(conn_id.as_deref()).await
+        };
 
         let history = self
             .session_store
@@ -582,11 +599,12 @@ impl ChatService for LiveChatService {
     }
 
     async fn context(&self, params: Value) -> ServiceResult {
-        let conn_id = params
-            .get("_conn_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_key = self.session_key_for(conn_id.as_deref()).await;
+        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
+            sk.to_string()
+        } else {
+            let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
+            self.session_key_for(conn_id.as_deref()).await
+        };
 
         // Session info
         let message_count = self.session_store.count(&session_key).await.unwrap_or(0);
@@ -600,6 +618,7 @@ impl ChatService for LiveChatService {
         });
 
         // Project info & context files
+        let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
         let project_id = if let Some(cid) = conn_id.as_deref() {
             let projects = self.state.active_projects.read().await;
             projects.get(cid).cloned()
@@ -905,6 +924,7 @@ async fn run_with_tools(
                 BroadcastOpts::default(),
             )
             .await;
+            deliver_channel_replies(state, session_key, &result.text).await;
             Some((
                 result.text,
                 result.usage.input_tokens,
@@ -1007,6 +1027,7 @@ async fn run_streaming(
                     BroadcastOpts::default(),
                 )
                 .await;
+                deliver_channel_replies(state, session_key, &accumulated).await;
                 return Some((accumulated, usage.input_tokens, usage.output_tokens));
             },
             StreamEvent::Error(msg) => {
@@ -1029,4 +1050,42 @@ async fn run_streaming(
         }
     }
     None
+}
+
+/// Drain any pending channel reply targets for a session and send the
+/// response text back to each originating channel via outbound.
+/// Each delivery runs in its own spawned task so slow network calls
+/// don't block each other or the chat pipeline.
+async fn deliver_channel_replies(state: &Arc<GatewayState>, session_key: &str, text: &str) {
+    let targets = state.drain_channel_replies(session_key).await;
+    if targets.is_empty() || text.is_empty() {
+        return;
+    }
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+    let text = text.to_string();
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let text = text.clone();
+        tokio::spawn(async move {
+            match target.channel_type.as_str() {
+                "telegram" => {
+                    if let Err(e) =
+                        outbound.send_text(&target.account_id, &target.chat_id, &text).await
+                    {
+                        warn!(
+                            account_id = target.account_id,
+                            chat_id = target.chat_id,
+                            "failed to send channel reply: {e}"
+                        );
+                    }
+                },
+                other => {
+                    warn!(channel_type = other, "unsupported channel type for reply");
+                },
+            }
+        });
+    }
 }

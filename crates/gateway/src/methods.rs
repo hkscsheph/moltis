@@ -38,6 +38,7 @@ const READ_METHODS: &[&str] = &[
     "logs.tail",
     "channels.status",
     "channels.list",
+    "channels.senders.list",
     "status",
     "usage.status",
     "usage.cost",
@@ -91,6 +92,8 @@ const WRITE_METHODS: &[&str] = &[
     "channels.add",
     "channels.remove",
     "channels.update",
+    "channels.senders.approve",
+    "channels.senders.deny",
     "sessions.switch",
     "projects.upsert",
     "projects.delete",
@@ -1175,6 +1178,45 @@ impl MethodRegistry {
             }),
         );
         self.register(
+            "channels.senders.list",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .channel
+                        .senders_list(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "channels.senders.approve",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .channel
+                        .sender_approve(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "channels.senders.deny",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .channel
+                        .sender_deny(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
             "send",
             Box::new(|ctx| {
                 Box::pin(async move {
@@ -2183,5 +2225,81 @@ impl MethodRegistry {
                 })
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scopes(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn senders_list_requires_read() {
+        // With read scope → authorized
+        assert!(
+            authorize_method("channels.senders.list", "operator", &scopes(&["operator.read"]))
+                .is_none()
+        );
+        // Without read or write → denied
+        assert!(authorize_method("channels.senders.list", "operator", &scopes(&[])).is_some());
+    }
+
+    #[test]
+    fn senders_approve_requires_write() {
+        assert!(authorize_method(
+            "channels.senders.approve",
+            "operator",
+            &scopes(&["operator.write"])
+        )
+        .is_none());
+        assert!(authorize_method(
+            "channels.senders.approve",
+            "operator",
+            &scopes(&["operator.read"])
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn senders_deny_requires_write() {
+        assert!(
+            authorize_method("channels.senders.deny", "operator", &scopes(&["operator.write"]))
+                .is_none()
+        );
+        assert!(
+            authorize_method("channels.senders.deny", "operator", &scopes(&["operator.read"]))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn admin_scope_allows_all_sender_methods() {
+        for method in &[
+            "channels.senders.list",
+            "channels.senders.approve",
+            "channels.senders.deny",
+        ] {
+            assert!(
+                authorize_method(method, "operator", &scopes(&["operator.admin"])).is_none(),
+                "admin should authorize {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_role_denied_sender_methods() {
+        for method in &[
+            "channels.senders.list",
+            "channels.senders.approve",
+            "channels.senders.deny",
+        ] {
+            assert!(
+                authorize_method(method, "node", &scopes(&["operator.admin"])).is_some(),
+                "node role should be denied for {method}"
+            );
+        }
     }
 }

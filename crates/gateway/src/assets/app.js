@@ -1558,6 +1558,20 @@
     return el;
   }
 
+  function stripChannelPrefix(text) {
+    return text.replace(/^\[Telegram(?:\s+from\s+[^\]]+)?\]\s*/, "");
+  }
+
+  function appendChannelFooter(el, channel) {
+    var ft = document.createElement("div");
+    ft.className = "msg-channel-footer";
+    var label = channel.channel_type || "channel";
+    var who = channel.username ? "@" + channel.username : channel.sender_name;
+    if (who) label += " \u00b7 " + who;
+    ft.textContent = "via " + label;
+    el.appendChild(ft);
+  }
+
   function removeThinking() {
     var el = document.getElementById("thinkingIndicator");
     if (el) el.remove();
@@ -1731,7 +1745,11 @@
         chatBatchLoading = true;
         history.forEach(function (msg) {
           if (msg.role === "user") {
-            msgEls.push(chatAddMsg("user", renderMarkdown(msg.content || ""), true));
+            var userContent = msg.content || "";
+            if (msg.channel) userContent = stripChannelPrefix(userContent);
+            var userEl = chatAddMsg("user", renderMarkdown(userContent), true);
+            if (userEl && msg.channel) appendChannelFooter(userEl, msg.channel);
+            msgEls.push(userEl);
           } else if (msg.role === "assistant") {
             var el = chatAddMsg("assistant", renderMarkdown(msg.content || ""), true);
             if (el && msg.model) {
@@ -3147,6 +3165,19 @@
       mentionSelect.appendChild(o);
     });
 
+    // Default Model
+    var modelLabel = createEl("label", { className: "text-xs text-[var(--muted)]", textContent: "Default Model" });
+    var modelSelect = createEl("select", {
+      className: "text-sm bg-[var(--surface2)] border border-[var(--border)] rounded px-3 py-2 text-[var(--text)] cursor-pointer",
+      style: "font-family:var(--font-body);"
+    });
+    var defaultOpt = createEl("option", { value: "", textContent: "(server default)" });
+    modelSelect.appendChild(defaultOpt);
+    models.forEach(function (m) {
+      var o = createEl("option", { value: m.id, textContent: m.displayName || m.id });
+      modelSelect.appendChild(o);
+    });
+
     // Allowlist
     var allowLabel = createEl("label", { className: "text-xs text-[var(--muted)]", textContent: "DM Allowlist (one username per line)" });
     var allowInput = createEl("textarea", {
@@ -3189,15 +3220,18 @@
       submitBtn.disabled = true;
       submitBtn.textContent = "Connecting...";
 
-      sendRpc("channels.add", {
-        type: "telegram",
-        account_id: accountId,
-        config: {
+      var addConfig = {
           token: token,
           dm_policy: dmSelect.value,
           mention_mode: mentionSelect.value,
           allowlist: allowlist
-        }
+      };
+      if (modelSelect.value) addConfig.model = modelSelect.value;
+
+      sendRpc("channels.add", {
+        type: "telegram",
+        account_id: accountId,
+        config: addConfig
       }).then(function (res) {
         submitBtn.disabled = false;
         submitBtn.textContent = "Connect Bot";
@@ -3220,6 +3254,8 @@
     form.appendChild(dmSelect);
     form.appendChild(mentionLabel);
     form.appendChild(mentionSelect);
+    form.appendChild(modelLabel);
+    form.appendChild(modelSelect);
     form.appendChild(allowLabel);
     form.appendChild(allowInput);
     form.appendChild(errorEl);
@@ -3271,6 +3307,20 @@
       mentionSelect.appendChild(o);
     });
 
+    // Default Model
+    var editModelLabel = createEl("label", { className: "text-xs text-[var(--muted)]", textContent: "Default Model" });
+    var editModelSelect = createEl("select", {
+      className: "text-sm bg-[var(--surface2)] border border-[var(--border)] rounded px-3 py-2 text-[var(--text)] cursor-pointer",
+      style: "font-family:var(--font-body);"
+    });
+    var editDefaultOpt = createEl("option", { value: "", textContent: "(server default)" });
+    editModelSelect.appendChild(editDefaultOpt);
+    models.forEach(function (m) {
+      var o = createEl("option", { value: m.id, textContent: m.displayName || m.id });
+      if (m.id === cfg.model) o.selected = true;
+      editModelSelect.appendChild(o);
+    });
+
     // Allowlist
     var allowLabel = createEl("label", { className: "text-xs text-[var(--muted)]", textContent: "DM Allowlist (one username per line)" });
     var allowInput = createEl("textarea", {
@@ -3299,14 +3349,17 @@
       saveBtn.disabled = true;
       saveBtn.textContent = "Saving...";
 
-      sendRpc("channels.update", {
-        account_id: ch.account_id,
-        config: {
+      var updateConfig = {
           token: cfg.token || "",
           dm_policy: dmSelect.value,
           mention_mode: mentionSelect.value,
           allowlist: allowlist
-        }
+      };
+      if (editModelSelect.value) updateConfig.model = editModelSelect.value;
+
+      sendRpc("channels.update", {
+        account_id: ch.account_id,
+        config: updateConfig
       }).then(function (res) {
         saveBtn.disabled = false;
         saveBtn.textContent = "Save Changes";
@@ -3325,6 +3378,8 @@
     form.appendChild(dmSelect);
     form.appendChild(mentionLabel);
     form.appendChild(mentionSelect);
+    form.appendChild(editModelLabel);
+    form.appendChild(editModelSelect);
     form.appendChild(allowLabel);
     form.appendChild(allowInput);
     form.appendChild(errorEl);
@@ -3343,23 +3398,199 @@
     '<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">' +
       '<div class="flex items-center gap-3">' +
         '<h2 class="text-lg font-medium text-[var(--text-strong)]">Channels</h2>' +
+        '<div style="display:flex;gap:4px;margin-left:12px;">' +
+          '<button id="chanTabChannels" class="session-action-btn" style="font-weight:600;">Channels</button>' +
+          '<button id="chanTabSenders" class="session-action-btn">Senders</button>' +
+        '</div>' +
         '<button id="chanAddBtn" class="bg-[var(--accent-dim)] text-white border-none px-3 py-1.5 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors">+ Add Telegram Bot</button>' +
       '</div>' +
       '<div id="channelPageList"></div>' +
+      '<div id="sendersPageContent" style="display:none;">' +
+        '<div style="margin-bottom:12px;">' +
+          '<label class="text-xs text-[var(--muted)]" style="margin-right:6px;">Account:</label>' +
+          '<select id="sendersAccountSelect" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px;"></select>' +
+        '</div>' +
+        '<div id="sendersTableWrap"></div>' +
+      '</div>' +
     '</div>';
 
   var refreshChannelsPage = null;
+  var channelEventUnsub = null;
 
   registerPage("/channels", function initChannels(container) {
-    container.innerHTML = channelsPageHTML;
+    // Safe: static hardcoded HTML template, no user input.
+    container.innerHTML = channelsPageHTML; // eslint-disable-line -- safe: hardcoded template
 
     var addBtn = $("chanAddBtn");
     var listEl = $("channelPageList");
+    var sendersContent = $("sendersPageContent");
+    var tabChannels = $("chanTabChannels");
+    var tabSenders = $("chanTabSenders");
+    var sendersSelect = $("sendersAccountSelect");
+    var sendersTableWrap = $("sendersTableWrap");
+    var activeTab = "channels";
+
+    // Real-time channel event listener (replaces polling).
+    channelEventUnsub = onEvent("channel", function (p) {
+      if (p.kind === "inbound_message" && activeTab === "senders" && sendersSelect.value === p.account_id) {
+        loadSenders();
+      }
+    });
+
+    function switchTab(tab) {
+      activeTab = tab;
+      if (tab === "channels") {
+        listEl.style.display = "";
+        sendersContent.style.display = "none";
+        addBtn.style.display = "";
+        tabChannels.style.fontWeight = "600";
+        tabSenders.style.fontWeight = "";
+        renderChannelList();
+      } else {
+        listEl.style.display = "none";
+        sendersContent.style.display = "";
+        addBtn.style.display = "none";
+        tabChannels.style.fontWeight = "";
+        tabSenders.style.fontWeight = "600";
+        loadSendersAccounts();
+      }
+    }
+
+    tabChannels.addEventListener("click", function () { switchTab("channels"); });
+    tabSenders.addEventListener("click", function () { switchTab("senders"); });
 
     addBtn.addEventListener("click", function () {
       if (connected) openChannelModal(renderChannelList);
     });
 
+    // ── Senders tab ──────────────────────────────────────────
+    function loadSendersAccounts() {
+      sendRpc("channels.status", {}).then(function (res) {
+        if (!res || !res.ok) return;
+        var channels = (res.payload && res.payload.channels) || [];
+        while (sendersSelect.firstChild) sendersSelect.removeChild(sendersSelect.firstChild);
+        if (channels.length === 0) {
+          sendersTableWrap.textContent = "No channels configured.";
+          return;
+        }
+        channels.forEach(function (ch) {
+          var opt = document.createElement("option");
+          opt.value = ch.account_id;
+          opt.textContent = ch.name || ch.account_id;
+          sendersSelect.appendChild(opt);
+        });
+        loadSenders();
+      });
+    }
+
+    sendersSelect.addEventListener("change", loadSenders);
+
+    function loadSenders() {
+      var accountId = sendersSelect.value;
+      if (!accountId) return;
+      sendRpc("channels.senders.list", { account_id: accountId }).then(function (res) {
+        if (!res || !res.ok) { sendersTableWrap.textContent = "Failed to load senders."; return; }
+        var senders = (res.payload && res.payload.senders) || [];
+        while (sendersTableWrap.firstChild) sendersTableWrap.removeChild(sendersTableWrap.firstChild);
+
+        if (senders.length === 0) {
+          sendersTableWrap.appendChild(createEl("div", {
+            className: "text-sm text-[var(--muted)]",
+            style: "text-align:center;padding:30px 0;",
+            textContent: "No messages received yet for this account."
+          }));
+          return;
+        }
+
+        var table = createEl("table", {
+          style: "width:100%;border-collapse:collapse;font-size:13px;"
+        });
+        var thead = document.createElement("thead");
+        var headerRow = document.createElement("tr");
+        ["Sender", "Username", "Messages", "Last Seen", "Status", "Action"].forEach(function (h) {
+          var th = createEl("th", {
+            textContent: h,
+            style: "text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);font-weight:500;color:var(--muted);font-size:11px;text-transform:uppercase;"
+          });
+          headerRow.appendChild(th);
+        });
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+
+        var tbody = document.createElement("tbody");
+        senders.forEach(function (s) {
+          var tr = document.createElement("tr");
+          tr.style.cssText = "border-bottom:1px solid var(--border);";
+
+          tr.appendChild(createEl("td", {
+            style: "padding:8px 10px;",
+            textContent: s.sender_name || s.peer_id
+          }));
+
+          tr.appendChild(createEl("td", {
+            style: "padding:8px 10px;color:var(--muted);",
+            textContent: s.username ? "@" + s.username : "\u2014"
+          }));
+
+          tr.appendChild(createEl("td", {
+            style: "padding:8px 10px;",
+            textContent: String(s.message_count)
+          }));
+
+          var lastSeen = s.last_seen ? new Date(s.last_seen * 1000).toLocaleString() : "\u2014";
+          tr.appendChild(createEl("td", {
+            style: "padding:8px 10px;color:var(--muted);font-size:12px;",
+            textContent: lastSeen
+          }));
+
+          var statusTd = document.createElement("td");
+          statusTd.style.cssText = "padding:8px 10px;";
+          statusTd.appendChild(createEl("span", {
+            className: "provider-item-badge " + (s.allowed ? "configured" : "oauth"),
+            textContent: s.allowed ? "Allowed" : "Denied"
+          }));
+          tr.appendChild(statusTd);
+
+          var actionTd = document.createElement("td");
+          actionTd.style.cssText = "padding:8px 10px;";
+          var identifier = s.username || s.peer_id;
+          if (s.allowed) {
+            var denyBtn = createEl("button", {
+              className: "session-action-btn session-delete",
+              textContent: "Deny",
+              title: "Remove from allowlist"
+            });
+            denyBtn.addEventListener("click", function () {
+              sendRpc("channels.senders.deny", {
+                account_id: accountId,
+                identifier: identifier
+              }).then(function () { loadSenders(); });
+            });
+            actionTd.appendChild(denyBtn);
+          } else {
+            var approveBtn = createEl("button", {
+              className: "session-action-btn",
+              textContent: "Approve",
+              title: "Add to allowlist"
+            });
+            approveBtn.style.cssText = "background:var(--accent-dim);color:white;";
+            approveBtn.addEventListener("click", function () {
+              sendRpc("channels.senders.approve", {
+                account_id: accountId,
+                identifier: identifier
+              }).then(function () { loadSenders(); });
+            });
+            actionTd.appendChild(approveBtn);
+          }
+          tr.appendChild(actionTd);
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        sendersTableWrap.appendChild(table);
+      });
+    }
+
+    // ── Channels tab ─────────────────────────────────────────
     function renderChannelList() {
       sendRpc("channels.status", {}).then(function (res) {
         if (!res || !res.ok) return;
@@ -3458,7 +3689,22 @@
     renderChannelList();
   }, function teardownChannels() {
     refreshChannelsPage = null;
+    if (channelEventUnsub) { channelEventUnsub(); channelEventUnsub = null; }
   });
+
+  // ── Event bus (pub/sub for WebSocket events) ─────────────
+  var eventListeners = {};
+
+  function onEvent(eventName, handler) {
+    (eventListeners[eventName] = eventListeners[eventName] || []).push(handler);
+    return function off() {
+      var arr = eventListeners[eventName];
+      if (arr) {
+        var idx = arr.indexOf(handler);
+        if (idx !== -1) arr.splice(idx, 1);
+      }
+    };
+  }
 
   // ── WebSocket ─────────────────────────────────────────────
   function connect() {
@@ -3508,11 +3754,18 @@
       }
 
       if (frame.type === "event") {
+        var listeners = eventListeners[frame.event] || [];
+        listeners.forEach(function(h) { h(frame.payload || {}); });
         if (frame.event === "chat") {
           var p = frame.payload || {};
           var eventSession = p.sessionKey || activeSessionKey;
           var isActive = eventSession === activeSessionKey;
           var isChatPage = currentPage === "/";
+
+          // Refresh the session sidebar when we see a session key we don't know about yet.
+          if (p.sessionKey && !sessions.find(function (s) { return s.key === p.sessionKey; })) {
+            fetchSessions();
+          }
 
           if (p.state === "thinking" && isActive && isChatPage) {
             removeThinking();
@@ -3596,6 +3849,18 @@
                 errMsg.textContent = p.error.detail;
                 toolCard.appendChild(errMsg);
               }
+            }
+          } else if (p.state === "channel_user" && isChatPage) {
+            // Switch to the channel session if sessionKey is provided.
+            if (p.sessionKey && p.sessionKey !== activeSessionKey) {
+              switchSession(p.sessionKey);
+            }
+            var isActive = p.sessionKey ? (p.sessionKey === activeSessionKey) : isActive;
+            if (!isActive) return;
+            var cleanText = stripChannelPrefix(p.text || "");
+            var el = chatAddMsg("user", renderMarkdown(cleanText), true);
+            if (el && p.channel) {
+              appendChannelFooter(el, p.channel);
             }
           } else if (p.state === "delta" && p.text && isActive && isChatPage) {
             removeThinking();

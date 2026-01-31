@@ -11,6 +11,7 @@ pub mod registry;
 pub mod store;
 
 pub use plugin::{
-    ChannelHealthSnapshot, ChannelOutbound, ChannelPlugin, ChannelStatus, ChannelStreamOutbound,
-    StreamEvent, StreamReceiver, StreamSender,
+    ChannelEvent, ChannelEventSink, ChannelHealthSnapshot, ChannelMessageMeta, ChannelOutbound,
+    ChannelPlugin, ChannelReplyTarget, ChannelStatus, ChannelStreamOutbound, StreamEvent,
+    StreamReceiver, StreamSender,
 };

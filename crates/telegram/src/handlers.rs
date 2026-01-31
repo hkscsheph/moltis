@@ -5,11 +5,11 @@ use {
         prelude::*,
         types::{MediaKind, MessageKind},
     },
-    tracing::{debug, info, warn},
+    tracing::{debug, warn},
 };
 
-use moltis_channels::message_log::MessageLogEntry;
-use moltis_common::types::{ChatType, MsgContext};
+use moltis_channels::{ChannelEvent, ChannelMessageMeta, ChannelOutbound, ChannelReplyTarget, message_log::MessageLogEntry};
+use moltis_common::types::ChatType;
 
 use crate::{access, state::AccountStateMap};
 
@@ -33,7 +33,7 @@ pub fn build_handler() -> Handler<
 /// Handle a single inbound Telegram message (called from manual polling loop).
 pub async fn handle_message_direct(
     msg: Message,
-    bot: &Bot,
+    _bot: &Bot,
     account_id: &str,
     accounts: &AccountStateMap,
 ) -> anyhow::Result<()> {
@@ -43,7 +43,7 @@ pub async fn handle_message_direct(
         return Ok(());
     }
 
-    let (config, bot_username, outbound, message_log) = {
+    let (config, bot_username, _outbound, message_log, event_sink) = {
         let accts = accounts.read().unwrap();
         let state = match accts.get(account_id) {
             Some(s) => s,
@@ -57,6 +57,7 @@ pub async fn handle_message_direct(
             state.bot_username.clone(),
             Arc::clone(&state.outbound),
             state.message_log.clone(),
+            state.event_sink.clone(),
         )
     };
 
@@ -129,6 +130,20 @@ pub async fn handle_message_direct(
         }
     }
 
+    // Emit channel event for real-time UI updates.
+    if let Some(ref sink) = event_sink {
+        sink.emit(ChannelEvent::InboundMessage {
+            channel_type: "telegram".into(),
+            account_id: account_id.to_string(),
+            peer_id: peer_id.clone(),
+            username: username.clone(),
+            sender_name: sender_name.clone(),
+            message_count: None,
+            access_granted,
+        })
+        .await;
+    }
+
     if let Err(reason) = access_result {
         warn!(account_id, %reason, peer_id, username = ?username, "handler: access denied");
         return Ok(());
@@ -136,40 +151,55 @@ pub async fn handle_message_direct(
 
     debug!(account_id, "handler: access granted");
 
-    let session_key = build_session_key(account_id, &chat_type, &peer_id, group_id.as_deref());
-
-    let reply_to_id = msg.reply_to_message().map(|r| r.id.0.to_string());
-
     let body = text.unwrap_or_default();
 
-    let msg_ctx = MsgContext {
-        body,
-        from: peer_id,
-        to: msg.chat.id.0.to_string(),
-        channel: "telegram".into(),
-        account_id: account_id.to_string(),
-        chat_type,
-        session_key,
-        reply_to_id,
-        media_path: None,
-        media_url: extract_media_url(&msg),
-        group_id,
-        guild_id: None,
-        team_id: None,
-        sender_name,
-    };
+    // Dispatch to the chat session (per-channel session key derived by the sink).
+    // The reply target tells the gateway where to send the LLM response back.
+    if let Some(ref sink) = event_sink && !body.is_empty() {
+        let reply_target = ChannelReplyTarget {
+            channel_type: "telegram".into(),
+            account_id: account_id.to_string(),
+            chat_id: msg.chat.id.0.to_string(),
+        };
 
-    // Dispatch to auto-reply pipeline
-    match moltis_auto_reply::reply::get_reply(&msg_ctx).await {
-        Ok(reply) => {
-            info!(account_id, to = %msg_ctx.to, text = %reply.text, "sending reply");
-            if let Err(e) = outbound.send_reply(bot, &msg_ctx.to, &reply).await {
-                warn!(account_id, "failed to send reply: {e}");
+        // Intercept slash commands before dispatching to the LLM.
+        if body.starts_with('/') {
+            let cmd = body.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+            if matches!(cmd, "new" | "clear" | "compact" | "context" | "help") {
+                let response = if cmd == "help" {
+                    "Available commands:\n/new — Start a new session\n/clear — Clear session history\n/compact — Compact session (summarize)\n/context — Show session context info\n/help — Show this help".to_string()
+                } else {
+                    match sink.dispatch_command(cmd, reply_target.clone()).await {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Error: {e}"),
+                    }
+                };
+                // Get the outbound Arc before awaiting (avoid holding RwLockReadGuard across await).
+                let outbound = {
+                    let accts = accounts.read().unwrap();
+                    accts.get(account_id).map(|s| Arc::clone(&s.outbound))
+                };
+                if let Some(outbound) = outbound
+                    && let Err(e) = outbound.send_text(account_id, &reply_target.chat_id, &response).await
+                {
+                    warn!(account_id, "failed to send command response: {e}");
+                }
+                return Ok(());
             }
-        },
-        Err(e) => {
-            warn!(account_id, "auto-reply failed: {e}");
-        },
+        }
+
+        let prefix = sender_name
+            .as_deref()
+            .map(|n| format!("[Telegram from {n}] "))
+            .unwrap_or_else(|| "[Telegram] ".to_string());
+        let meta = ChannelMessageMeta {
+            channel_type: "telegram".into(),
+            sender_name: sender_name.clone(),
+            username: username.clone(),
+            model: config.model.clone(),
+        };
+        sink.dispatch_to_chat(&format!("{prefix}{body}"), reply_target, meta)
+            .await;
     }
 
     Ok(())
@@ -214,6 +244,7 @@ fn has_media(msg: &Message) -> bool {
 }
 
 /// Extract a file ID reference from a message for later download.
+#[allow(dead_code)]
 fn extract_media_url(msg: &Message) -> Option<String> {
     match &msg.kind {
         MessageKind::Common(common) => match &common.media_kind {
@@ -253,6 +284,7 @@ fn check_bot_mentioned(msg: &Message, bot_username: Option<&str>) -> bool {
 }
 
 /// Build a session key.
+#[allow(dead_code)]
 fn build_session_key(
     account_id: &str,
     chat_type: &ChatType,

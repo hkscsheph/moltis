@@ -2,6 +2,59 @@ use {
     anyhow::Result, async_trait::async_trait, moltis_common::types::ReplyPayload, tokio::sync::mpsc,
 };
 
+// ── Channel events (pub/sub) ────────────────────────────────────────────────
+
+/// Events emitted by channel plugins for real-time UI updates.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChannelEvent {
+    InboundMessage {
+        channel_type: String,
+        account_id: String,
+        peer_id: String,
+        username: Option<String>,
+        sender_name: Option<String>,
+        message_count: Option<i64>,
+        access_granted: bool,
+    },
+}
+
+/// Sink for channel events — the gateway provides the concrete implementation.
+#[async_trait]
+pub trait ChannelEventSink: Send + Sync {
+    /// Broadcast a channel event for real-time UI updates.
+    async fn emit(&self, event: ChannelEvent);
+
+    /// Dispatch an inbound message to the main chat session (like sending
+    /// from the web UI). The response is broadcast over WebSocket and
+    /// routed back to the originating channel.
+    async fn dispatch_to_chat(&self, text: &str, reply_to: ChannelReplyTarget, meta: ChannelMessageMeta);
+
+    /// Dispatch a slash command (e.g. "new", "clear", "compact", "context")
+    /// and return a text result to send back to the channel.
+    async fn dispatch_command(&self, command: &str, reply_to: ChannelReplyTarget) -> anyhow::Result<String>;
+}
+
+/// Metadata about a channel message, used for UI display.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelMessageMeta {
+    pub channel_type: String,
+    pub sender_name: Option<String>,
+    pub username: Option<String>,
+    /// Default model configured for this channel account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Where to send the LLM response back.
+#[derive(Debug, Clone)]
+pub struct ChannelReplyTarget {
+    pub channel_type: String,
+    pub account_id: String,
+    /// Chat/peer ID to send the reply to.
+    pub chat_id: String,
+}
+
 /// Core channel plugin trait. Each messaging platform implements this.
 #[async_trait]
 pub trait ChannelPlugin: Send + Sync {
@@ -29,6 +82,10 @@ pub trait ChannelPlugin: Send + Sync {
 pub trait ChannelOutbound: Send + Sync {
     async fn send_text(&self, account_id: &str, to: &str, text: &str) -> Result<()>;
     async fn send_media(&self, account_id: &str, to: &str, payload: &ReplyPayload) -> Result<()>;
+    /// Send a "typing" indicator. No-op by default.
+    async fn send_typing(&self, _account_id: &str, _to: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Probe channel account health.

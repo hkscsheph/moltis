@@ -14,6 +14,7 @@ pub mod approval;
 pub mod auth;
 pub mod broadcast;
 pub mod channel;
+pub mod channel_events;
 pub mod channel_store;
 pub mod chat;
 pub mod chat_error;
