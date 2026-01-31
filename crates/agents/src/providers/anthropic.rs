@@ -70,6 +70,10 @@ impl LlmProvider for AnthropicProvider {
         true
     }
 
+    fn context_window(&self) -> u32 {
+        super::context_window_for_model(&self.model)
+    }
+
     async fn complete(
         &self,
         messages: &[serde_json::Value],

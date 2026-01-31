@@ -1345,7 +1345,68 @@
       tokenSection.appendChild(ctxRow("System Prompt", formatTokens(tu.systemPromptTokens)));
     }
     tokenSection.appendChild(ctxRow("Total", formatTokens(tu.estimatedTotal || 0), true));
+    if (tu.contextWindow > 0) {
+      tokenSection.appendChild(ctxRow("Context Window", formatTokens(tu.contextWindow)));
+      sessionContextWindow = tu.contextWindow;
+      updateTokenBar();
+    }
     card.appendChild(tokenSection);
+
+    chatMsgBox.appendChild(card);
+    chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
+  }
+
+  function renderCompactCard(data) {
+    if (!chatMsgBox) return;
+    slashInjectStyles();
+
+    var card = ctxEl("div", "ctx-card");
+
+    // Header with compress icon
+    var header = ctxEl("div", "ctx-header");
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "16");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    // Compress/shrink icon (two arrows pointing inward)
+    var p1 = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    p1.setAttribute("points", "4 14 10 14 10 20");
+    var p2 = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    p2.setAttribute("points", "20 10 14 10 14 4");
+    var l1 = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    l1.setAttribute("x1", "14"); l1.setAttribute("y1", "10");
+    l1.setAttribute("x2", "21"); l1.setAttribute("y2", "3");
+    var l2 = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    l2.setAttribute("x1", "3"); l2.setAttribute("y1", "21");
+    l2.setAttribute("x2", "10"); l2.setAttribute("y2", "14");
+    svg.appendChild(p1);
+    svg.appendChild(p2);
+    svg.appendChild(l1);
+    svg.appendChild(l2);
+    header.appendChild(svg);
+    header.appendChild(ctxEl("span", "ctx-header-title", "Conversation compacted"));
+    card.appendChild(header);
+
+    // Stats section
+    var statsSection = ctxSection("Before compact");
+    statsSection.appendChild(ctxRow("Messages", String(data.messageCount || 0)));
+    statsSection.appendChild(ctxRow("Total tokens", formatTokens(data.totalTokens || 0)));
+    if (data.contextWindow) {
+      var pctUsed = Math.round((data.totalTokens || 0) / data.contextWindow * 100);
+      statsSection.appendChild(ctxRow("Context usage", pctUsed + "% of " + formatTokens(data.contextWindow)));
+    }
+    card.appendChild(statsSection);
+
+    // After section
+    var afterSection = ctxSection("After compact");
+    afterSection.appendChild(ctxRow("Messages", "1 (summary)"));
+    afterSection.appendChild(ctxRow("Status", "Conversation history replaced with a summary"));
+    card.appendChild(afterSection);
 
     chatMsgBox.appendChild(card);
     chatMsgBox.scrollTop = chatMsgBox.scrollHeight;
@@ -1528,6 +1589,7 @@
     streamEl = null;
     streamText = "";
     sessionTokens = { input: 0, output: 0 };
+    sessionContextWindow = 0;
     updateTokenBar();
 
     var items = sessionList.querySelectorAll(".session-item");
@@ -1591,6 +1653,13 @@
           }
         });
         chatBatchLoading = false;
+        // Fetch context window for the token bar percentage display.
+        sendRpc("chat.context", {}).then(function (ctxRes) {
+          if (ctxRes && ctxRes.ok && ctxRes.payload && ctxRes.payload.tokenUsage) {
+            sessionContextWindow = ctxRes.payload.tokenUsage.contextWindow || 0;
+          }
+          updateTokenBar();
+        });
         updateTokenBar();
 
         if (searchContext && searchContext.query && chatMsgBox) {
@@ -1761,6 +1830,8 @@
     return String(n);
   }
 
+  var sessionContextWindow = 0;
+
   function updateTokenBar() {
     var bar = $("tokenBar");
     if (!bar) return;
@@ -1769,10 +1840,15 @@
       bar.textContent = "";
       return;
     }
-    bar.textContent =
+    var text =
       formatTokens(sessionTokens.input) + " in / " +
       formatTokens(sessionTokens.output) + " out \u00b7 " +
       formatTokens(total) + " tokens";
+    if (sessionContextWindow > 0) {
+      var pct = Math.max(0, 100 - Math.round(total / sessionContextWindow * 100));
+      text += " \u00b7 Context left before auto-compact: " + pct + "%";
+    }
+    bar.textContent = text;
   }
 
   // Safe: static hardcoded HTML template, no user input.
@@ -3110,6 +3186,22 @@
               streamEl = null;
               streamText = "";
               lastToolOutput = "";
+            }
+          } else if (p.state === "auto_compact") {
+            if (isActive && isChatPage) {
+              if (p.phase === "start") {
+                chatAddMsg("system", "Compacting conversation (context limit reached)\u2026");
+              } else if (p.phase === "done") {
+                // Remove the "Compacting..." message
+                if (chatMsgBox && chatMsgBox.lastChild) chatMsgBox.removeChild(chatMsgBox.lastChild);
+                renderCompactCard(p);
+                // Reset session tokens since history was replaced
+                sessionTokens = { input: 0, output: 0 };
+                updateTokenBar();
+              } else if (p.phase === "error") {
+                if (chatMsgBox && chatMsgBox.lastChild) chatMsgBox.removeChild(chatMsgBox.lastChild);
+                chatAddMsg("error", "Auto-compact failed: " + (p.error || "unknown error"));
+              }
             }
           } else if (p.state === "error") {
             setSessionReplying(eventSession, false);

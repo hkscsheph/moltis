@@ -31,6 +31,12 @@ pub trait LlmProvider: Send + Sync {
         false
     }
 
+    /// Context window size in tokens for this model.
+    /// Used to detect when conversation approaches the limit and trigger auto-compact.
+    fn context_window(&self) -> u32 {
+        200_000
+    }
+
     /// Stream a completion, yielding delta/done/error events.
     fn stream(
         &self,

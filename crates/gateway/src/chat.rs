@@ -285,6 +285,85 @@ impl ChatService for LiveChatService {
             )
         };
 
+        // Auto-compact: if conversation input tokens exceed 95% of context window, compact first.
+        let context_window = provider.context_window() as u64;
+        let total_input: u64 = history
+            .iter()
+            .filter_map(|m| m.get("inputTokens").and_then(|v| v.as_u64()))
+            .sum();
+        if total_input >= context_window * 95 / 100 {
+            let pre_compact_msg_count = history.len();
+            let total_output: u64 = history
+                .iter()
+                .filter_map(|m| m.get("outputTokens").and_then(|v| v.as_u64()))
+                .sum();
+            let pre_compact_total = total_input + total_output;
+
+            info!(
+                session = %session_key,
+                total_input,
+                context_window,
+                "auto-compact triggered (95% threshold reached)"
+            );
+            broadcast(
+                &self.state,
+                "chat",
+                serde_json::json!({
+                    "sessionKey": session_key,
+                    "state": "auto_compact",
+                    "phase": "start",
+                    "messageCount": pre_compact_msg_count,
+                    "totalTokens": pre_compact_total,
+                    "inputTokens": total_input,
+                    "outputTokens": total_output,
+                    "contextWindow": context_window,
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+
+            let compact_params = serde_json::json!({ "_conn_id": conn_id });
+            match self.compact(compact_params).await {
+                Ok(_) => {
+                    // Reload history after compaction.
+                    history = self
+                        .session_store
+                        .read(&session_key)
+                        .await
+                        .unwrap_or_default();
+                    broadcast(
+                        &self.state,
+                        "chat",
+                        serde_json::json!({
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "done",
+                            "messageCount": pre_compact_msg_count,
+                            "totalTokens": pre_compact_total,
+                            "contextWindow": context_window,
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                },
+                Err(e) => {
+                    warn!(session = %session_key, error = %e, "auto-compact failed, proceeding with full history");
+                    broadcast(
+                        &self.state,
+                        "chat",
+                        serde_json::json!({
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "error",
+                            "error": e.to_string(),
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                },
+            }
+        }
+
         let handle = tokio::spawn(async move {
             let ctx_ref = project_context.as_deref();
             let stats_ref = Some(session_stats.as_str());
@@ -430,11 +509,27 @@ impl ChatService for LiveChatService {
             "content": conversation_text,
         }));
 
-        // Use the first available provider to generate the summary.
+        // Use the session's model if available, otherwise fall back to the model
+        // from the last assistant message, then to the first registered provider.
         let provider = {
             let reg = self.providers.read().await;
-            reg.first()
-                .ok_or_else(|| "no LLM providers configured".to_string())?
+            let session_model = self
+                .session_metadata
+                .get(&session_key)
+                .await
+                .and_then(|e| e.model.clone());
+            let history_model = history
+                .iter()
+                .rev()
+                .find_map(|m| m.get("model").and_then(|v| v.as_str()).map(String::from));
+            let model_id = session_model.or(history_model);
+            if let Some(ref id) = model_id {
+                reg.get(id)
+            } else {
+                None
+            }
+            .or_else(|| reg.first())
+            .ok_or_else(|| "no LLM providers configured".to_string())?
         };
 
         info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
@@ -590,6 +685,14 @@ impl ChatService for LiveChatService {
         let total_estimated_tokens =
             conversation_tokens + context_file_tokens + system_prompt_tokens;
 
+        // Context window from current provider
+        let context_window = {
+            let reg = self.providers.read().await;
+            reg.first()
+                .map(|p| p.context_window())
+                .unwrap_or(200_000)
+        };
+
         // Sandbox info
         let sandbox_info = if let Some(ref router) = self.state.sandbox_router {
             let is_sandboxed = router.is_sandboxed(&session_key).await;
@@ -619,6 +722,7 @@ impl ChatService for LiveChatService {
                 "contextFileTokens": context_file_tokens,
                 "systemPromptTokens": system_prompt_tokens,
                 "estimatedTotal": total_estimated_tokens,
+                "contextWindow": context_window,
             },
         }))
     }
