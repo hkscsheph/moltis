@@ -1993,7 +1993,7 @@
 
       var thead = document.createElement("thead");
       var headRow = document.createElement("tr");
-      ["Name", "Schedule", "Enabled", "Next Run", "Last Status", "Actions"].forEach(function (h) {
+      ["Name", "Schedule", "Next Run", "Last Status", "Enabled", "Actions"].forEach(function (h) {
         var th = document.createElement("th");
         th.textContent = h;
         headRow.appendChild(th);
@@ -2015,24 +2015,6 @@
         tdSched.style.fontSize = ".78rem";
         tr.appendChild(tdSched);
 
-        var tdEnabled = document.createElement("td");
-        var toggle = document.createElement("label");
-        toggle.className = "cron-toggle";
-        var checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = job.enabled;
-        checkbox.addEventListener("change", function () {
-          sendRpc("cron.update", { id: job.id, patch: { enabled: checkbox.checked } }).then(function () {
-            loadStatus();
-          });
-        });
-        toggle.appendChild(checkbox);
-        var slider = document.createElement("span");
-        slider.className = "cron-slider";
-        toggle.appendChild(slider);
-        tdEnabled.appendChild(toggle);
-        tr.appendChild(tdEnabled);
-
         var tdNext = document.createElement("td");
         tdNext.style.fontSize = ".78rem";
         tdNext.textContent = job.state && job.state.nextRunAtMs
@@ -2050,6 +2032,24 @@
           tdStatus.textContent = "\u2014";
         }
         tr.appendChild(tdStatus);
+
+        var tdEnabled = document.createElement("td");
+        var toggle = document.createElement("label");
+        toggle.className = "cron-toggle";
+        var checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = job.enabled;
+        checkbox.addEventListener("change", function () {
+          sendRpc("cron.update", { id: job.id, patch: { enabled: checkbox.checked } }).then(function () {
+            loadStatus();
+          });
+        });
+        toggle.appendChild(checkbox);
+        var slider = document.createElement("span");
+        slider.className = "cron-slider";
+        toggle.appendChild(slider);
+        tdEnabled.appendChild(toggle);
+        tr.appendChild(tdEnabled);
 
         var tdActions = document.createElement("td");
         tdActions.className = "cron-actions";
