@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use {async_trait::async_trait, serde_json::Value};
 
-use moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore};
+use {
+    moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
+    moltis_tools::sandbox::SandboxRouter,
+};
 
 use crate::services::{ServiceResult, SessionService};
 
@@ -10,11 +13,21 @@ use crate::services::{ServiceResult, SessionService};
 pub struct LiveSessionService {
     store: Arc<SessionStore>,
     metadata: Arc<SqliteSessionMetadata>,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl LiveSessionService {
     pub fn new(store: Arc<SessionStore>, metadata: Arc<SqliteSessionMetadata>) -> Self {
-        Self { store, metadata }
+        Self {
+            store,
+            metadata,
+            sandbox_router: None,
+        }
+    }
+
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
     }
 }
 
@@ -35,6 +48,7 @@ impl SessionService for LiveSessionService {
                     "createdAt": e.created_at,
                     "updatedAt": e.updated_at,
                     "messageCount": e.message_count,
+                    "sandbox_enabled": e.sandbox_enabled,
                 })
             })
             .collect();
@@ -76,6 +90,7 @@ impl SessionService for LiveSessionService {
                 "messageCount": entry.message_count,
                 "projectId": entry.project_id,
                 "archived": entry.archived,
+                "sandbox_enabled": entry.sandbox_enabled,
             },
             "history": history,
         }))
@@ -112,6 +127,19 @@ impl SessionService for LiveSessionService {
                 .map(String::from);
             self.metadata.set_project_id(key, project_id).await;
         }
+        // Update sandbox_enabled if provided.
+        if params.get("sandbox_enabled").is_some() {
+            let sandbox_enabled = params.get("sandbox_enabled").and_then(|v| v.as_bool());
+            self.metadata.set_sandbox_enabled(key, sandbox_enabled).await;
+            // Push override to sandbox router.
+            if let Some(ref router) = self.sandbox_router {
+                if let Some(enabled) = sandbox_enabled {
+                    router.set_override(key, enabled).await;
+                } else {
+                    router.remove_override(key).await;
+                }
+            }
+        }
 
         let entry = self.metadata.get(key).await.unwrap();
         Ok(serde_json::json!({
@@ -119,6 +147,7 @@ impl SessionService for LiveSessionService {
             "key": entry.key,
             "label": entry.label,
             "model": entry.model,
+            "sandbox_enabled": entry.sandbox_enabled,
         }))
     }
 
@@ -145,6 +174,14 @@ impl SessionService for LiveSessionService {
         }
 
         self.store.clear(key).await.map_err(|e| e.to_string())?;
+
+        // Clean up sandbox resources for this session.
+        if let Some(ref router) = self.sandbox_router {
+            if let Err(e) = router.cleanup_session(key).await {
+                tracing::warn!("sandbox cleanup for session {key}: {e}");
+            }
+        }
+
         self.metadata.remove(key).await;
 
         Ok(serde_json::json!({}))

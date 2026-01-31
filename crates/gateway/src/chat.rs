@@ -13,7 +13,7 @@ use {
         model::StreamEvent,
         prompt::build_system_prompt,
         providers::ProviderRegistry,
-        runner::{RunnerEvent, run_agent_loop},
+        runner::{RunnerEvent, run_agent_loop_with_context},
         tool_registry::ToolRegistry,
     },
     moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
@@ -461,14 +461,18 @@ async fn run_with_tools(
         Some(history.to_vec())
     };
 
+    // Inject session key into tool call params so tools can resolve per-session state.
+    let tool_context = serde_json::json!({ "_session_key": session_key });
+
     let provider_ref = provider.clone();
-    match run_agent_loop(
+    match run_agent_loop_with_context(
         provider,
         tool_registry,
         &system_prompt,
         text,
         Some(&on_event),
         hist,
+        Some(tool_context),
     )
     .await
     {

@@ -114,6 +114,29 @@ pub async fn run_agent_loop(
     on_event: Option<&OnEvent>,
     history: Option<Vec<serde_json::Value>>,
 ) -> Result<AgentRunResult> {
+    run_agent_loop_with_context(
+        provider,
+        tools,
+        system_prompt,
+        user_message,
+        on_event,
+        history,
+        None,
+    )
+    .await
+}
+
+/// Like `run_agent_loop` but accepts optional context values that are injected
+/// into every tool call's parameters (e.g. `_session_key`).
+pub async fn run_agent_loop_with_context(
+    provider: Arc<dyn LlmProvider>,
+    tools: &ToolRegistry,
+    system_prompt: &str,
+    user_message: &str,
+    on_event: Option<&OnEvent>,
+    history: Option<Vec<serde_json::Value>>,
+    tool_context: Option<serde_json::Value>,
+) -> Result<AgentRunResult> {
     let native_tools = provider.supports_tools();
     let tool_schemas = tools.list_schemas();
 
@@ -285,7 +308,17 @@ pub async fn run_agent_loop(
             info!(tool = %tc.name, id = %tc.id, args = %tc.arguments, "executing tool");
 
             let result = if let Some(tool) = tools.get(&tc.name) {
-                match tool.execute(tc.arguments.clone()).await {
+                // Merge tool_context (e.g. _session_key) into the tool call params.
+                let mut args = tc.arguments.clone();
+                if let Some(ref ctx) = tool_context {
+                    if let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
+                    {
+                        for (k, v) in ctx_obj {
+                            args_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                match tool.execute(args).await {
                     Ok(val) => {
                         info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
                         trace!(tool = %tc.name, result = %val, "tool result");

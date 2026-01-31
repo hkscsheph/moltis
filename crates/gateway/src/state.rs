@@ -11,7 +11,7 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use moltis_protocol::ConnectParams;
 
-use moltis_tools::approval::ApprovalManager;
+use moltis_tools::{approval::ApprovalManager, sandbox::SandboxRouter};
 
 use crate::{
     auth::ResolvedAuth, nodes::NodeRegistry, pairing::PairingState, services::GatewayServices,
@@ -156,6 +156,8 @@ pub struct GatewayState {
     pub active_sessions: RwLock<HashMap<String, String>>,
     /// Active project id per connection (conn_id → project id).
     pub active_projects: RwLock<HashMap<String, String>>,
+    /// Per-session sandbox router (None if sandbox is not configured).
+    pub sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl GatewayState {
@@ -163,6 +165,15 @@ impl GatewayState {
         auth: ResolvedAuth,
         services: GatewayServices,
         approval_manager: Arc<ApprovalManager>,
+    ) -> Arc<Self> {
+        Self::with_sandbox_router(auth, services, approval_manager, None)
+    }
+
+    pub fn with_sandbox_router(
+        auth: ResolvedAuth,
+        services: GatewayServices,
+        approval_manager: Arc<ApprovalManager>,
+        sandbox_router: Option<Arc<SandboxRouter>>,
     ) -> Arc<Self> {
         let hostname = hostname::get()
             .ok()
@@ -184,6 +195,7 @@ impl GatewayState {
             chat_override: RwLock::new(None),
             active_sessions: RwLock::new(HashMap::new()),
             active_projects: RwLock::new(HashMap::new()),
+            sandbox_router,
         })
     }
 

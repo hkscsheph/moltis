@@ -45,6 +45,18 @@ impl Default for ExecConfig {
     }
 }
 
+/// Resource limits for sandboxed execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceLimitsConfig {
+    /// Memory limit (e.g. "512M", "1G").
+    pub memory_limit: Option<String>,
+    /// CPU quota as a fraction (e.g. 0.5 = half a core, 2.0 = two cores).
+    pub cpu_quota: Option<f64>,
+    /// Maximum number of PIDs.
+    pub pids_max: Option<u32>,
+}
+
 /// Sandbox configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -55,17 +67,19 @@ pub struct SandboxConfig {
     pub image: Option<String>,
     pub container_prefix: Option<String>,
     pub no_network: bool,
+    pub resource_limits: ResourceLimitsConfig,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            mode: "off".into(),
+            mode: "all".into(),
             scope: "session".into(),
             workspace_mount: "ro".into(),
             image: None,
             container_prefix: None,
             no_network: true,
+            resource_limits: ResourceLimitsConfig::default(),
         }
     }
 }

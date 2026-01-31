@@ -185,11 +185,7 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
     let session_store = Arc::new(SessionStore::new(sessions_dir));
     let session_metadata = Arc::new(SqliteSessionMetadata::new(db_pool.clone()));
 
-    // Wire live session service.
-    services.session = Arc::new(LiveSessionService::new(
-        Arc::clone(&session_store),
-        Arc::clone(&session_metadata),
-    ));
+    // Session service wired below after sandbox_router is created.
 
     // Wire live project service.
     services.project = Arc::new(crate::project::LiveProjectService::new(project_store));
@@ -251,7 +247,61 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
     let live_cron = Arc::new(crate::cron::LiveCronService::new(Arc::clone(&cron_service)));
     services = services.with_cron(live_cron);
 
-    let state = GatewayState::new(resolved_auth, services, Arc::clone(&approval_manager));
+    // Build sandbox router from config (shared across sessions).
+    let sandbox_config = moltis_tools::sandbox::SandboxConfig {
+        mode: match config.tools.exec.sandbox.mode.as_str() {
+            "all" => moltis_tools::sandbox::SandboxMode::All,
+            "non-main" | "nonmain" => moltis_tools::sandbox::SandboxMode::NonMain,
+            _ => moltis_tools::sandbox::SandboxMode::Off,
+        },
+        scope: match config.tools.exec.sandbox.scope.as_str() {
+            "agent" => moltis_tools::sandbox::SandboxScope::Agent,
+            "shared" => moltis_tools::sandbox::SandboxScope::Shared,
+            _ => moltis_tools::sandbox::SandboxScope::Session,
+        },
+        workspace_mount: match config.tools.exec.sandbox.workspace_mount.as_str() {
+            "rw" => moltis_tools::sandbox::WorkspaceMount::Rw,
+            "none" => moltis_tools::sandbox::WorkspaceMount::None,
+            _ => moltis_tools::sandbox::WorkspaceMount::Ro,
+        },
+        image: config.tools.exec.sandbox.image.clone(),
+        container_prefix: config.tools.exec.sandbox.container_prefix.clone(),
+        no_network: config.tools.exec.sandbox.no_network,
+        resource_limits: moltis_tools::sandbox::ResourceLimits {
+            memory_limit: config
+                .tools
+                .exec
+                .sandbox
+                .resource_limits
+                .memory_limit
+                .clone(),
+            cpu_quota: config.tools.exec.sandbox.resource_limits.cpu_quota,
+            pids_max: config.tools.exec.sandbox.resource_limits.pids_max,
+        },
+    };
+    let sandbox_router = Arc::new(moltis_tools::sandbox::SandboxRouter::new(sandbox_config));
+
+    // Load any persisted sandbox overrides from session metadata.
+    {
+        for entry in session_metadata.list().await {
+            if let Some(enabled) = entry.sandbox_enabled {
+                sandbox_router.set_override(&entry.key, enabled).await;
+            }
+        }
+    }
+
+    // Wire live session service with sandbox router.
+    services.session = Arc::new(
+        LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
+            .with_sandbox_router(Arc::clone(&sandbox_router)),
+    );
+
+    let state = GatewayState::with_sandbox_router(
+        resolved_auth,
+        services,
+        Arc::clone(&approval_manager),
+        Some(Arc::clone(&sandbox_router)),
+    );
     // Populate the deferred reference so cron callbacks can reach the gateway.
     let _ = deferred_state.set(Arc::clone(&state));
 
@@ -259,7 +309,8 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
     if !registry.read().await.is_empty() {
         let broadcaster = Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
         let exec_tool = moltis_tools::exec::ExecTool::default()
-            .with_approval(Arc::clone(&approval_manager), broadcaster);
+            .with_approval(Arc::clone(&approval_manager), broadcaster)
+            .with_sandbox_router(Arc::clone(&sandbox_router));
 
         let cron_tool = moltis_tools::cron_tool::CronTool::new(Arc::clone(&cron_service));
 

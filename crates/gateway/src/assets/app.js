@@ -79,6 +79,37 @@
   function setSessionModel(sessionKey, modelId) {
     sendRpc("sessions.patch", { key: sessionKey, model: modelId });
   }
+
+  // ── Sandbox toggle ───────────────────────────────────────────
+  var sandboxToggleBtn = $("sandboxToggle");
+  var sandboxLabel = $("sandboxLabel");
+  var sessionSandboxEnabled = true;
+
+  function updateSandboxUI(enabled) {
+    sessionSandboxEnabled = !!enabled;
+    if (sessionSandboxEnabled) {
+      sandboxLabel.textContent = "sandboxed";
+      sandboxToggleBtn.style.borderColor = "var(--accent, #f59e0b)";
+      sandboxToggleBtn.style.color = "var(--accent, #f59e0b)";
+    } else {
+      sandboxLabel.textContent = "direct";
+      sandboxToggleBtn.style.borderColor = "";
+      sandboxToggleBtn.style.color = "var(--muted)";
+    }
+  }
+
+  updateSandboxUI(true); // default: sandboxed
+
+  sandboxToggleBtn.addEventListener("click", function () {
+    var newVal = !sessionSandboxEnabled;
+    sendRpc("sessions.patch", { key: activeSessionKey, sandbox_enabled: newVal }).then(function (res) {
+      if (res && res.result) {
+        updateSandboxUI(res.result.sandbox_enabled);
+      } else {
+        updateSandboxUI(newVal);
+      }
+    });
+  });
   var sessionsPanel = $("sessionsPanel");
   var sessionList = $("sessionList");
   var newSessionBtn = $("newSessionBtn");
@@ -1232,6 +1263,8 @@
             localStorage.setItem("moltis-model", found.id);
           }
         }
+        // Restore sandbox state
+        updateSandboxUI(entry.sandbox_enabled);
         var history = res.payload.history || [];
         var msgEls = [];
         history.forEach(function (msg) {

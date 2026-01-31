@@ -10,7 +10,10 @@ use {
 
 use moltis_agents::tool_registry::AgentTool;
 
-use crate::approval::{ApprovalAction, ApprovalDecision, ApprovalManager};
+use crate::{
+    approval::{ApprovalAction, ApprovalDecision, ApprovalManager},
+    sandbox::{NoSandbox, Sandbox, SandboxId, SandboxRouter},
+};
 
 /// Broadcaster that notifies connected clients about pending approval requests.
 #[async_trait]
@@ -117,6 +120,9 @@ pub struct ExecTool {
     pub working_dir: Option<PathBuf>,
     approval_manager: Option<Arc<ApprovalManager>>,
     broadcaster: Option<Arc<dyn ApprovalBroadcaster>>,
+    sandbox: Arc<dyn Sandbox>,
+    sandbox_id: Option<SandboxId>,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl Default for ExecTool {
@@ -127,6 +133,9 @@ impl Default for ExecTool {
             working_dir: None,
             approval_manager: None,
             broadcaster: None,
+            sandbox: Arc::new(NoSandbox),
+            sandbox_id: None,
+            sandbox_router: None,
         }
     }
 }
@@ -141,6 +150,27 @@ impl ExecTool {
         self.approval_manager = Some(manager);
         self.broadcaster = Some(broadcaster);
         self
+    }
+
+    /// Attach a sandbox backend and ID for sandboxed execution (legacy static mode).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn Sandbox>, id: SandboxId) -> Self {
+        self.sandbox = sandbox;
+        self.sandbox_id = Some(id);
+        self
+    }
+
+    /// Attach a sandbox router for per-session dynamic sandbox resolution.
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
+    }
+
+    /// Clean up sandbox resources. Call on session end.
+    pub async fn cleanup(&self) -> Result<()> {
+        if let Some(ref id) = self.sandbox_id {
+            self.sandbox.cleanup(id).await?;
+        }
+        Ok(())
     }
 }
 
@@ -233,7 +263,26 @@ impl AgentTool for ExecTool {
             env: Vec::new(),
         };
 
-        let result = exec_command(command, &opts).await?;
+        // Resolve sandbox: dynamic per-session router takes priority over static sandbox.
+        let session_key = params.get("_session_key").and_then(|v| v.as_str());
+
+        let result = if let Some(ref router) = self.sandbox_router {
+            let sk = session_key.unwrap_or("main");
+            if router.is_sandboxed(sk).await {
+                let id = router.sandbox_id_for(sk);
+                let backend = router.backend();
+                backend.ensure_ready(&id).await?;
+                backend.exec(&id, command, &opts).await?
+            } else {
+                exec_command(command, &opts).await?
+            }
+        } else if let Some(ref id) = self.sandbox_id {
+            self.sandbox.ensure_ready(id).await?;
+            self.sandbox.exec(id, command, &opts).await?
+        } else {
+            exec_command(command, &opts).await?
+        };
+
         info!(
             command,
             exit_code = result.exit_code,
@@ -323,8 +372,6 @@ mod tests {
             .execute(serde_json::json!({ "command": "pwd", "working_dir": "" }))
             .await
             .unwrap();
-        // Should succeed (not fail with "No such file or directory") and
-        // use the current directory.
         assert_eq!(result["exit_code"], 0);
         assert!(!result["stdout"].as_str().unwrap().trim().is_empty());
     }
@@ -335,7 +382,6 @@ mod tests {
         let bc = Arc::new(TestBroadcaster::new());
         let bc_dyn: Arc<dyn ApprovalBroadcaster> = Arc::clone(&bc) as _;
         let tool = ExecTool::default().with_approval(Arc::clone(&mgr), bc_dyn);
-        // "echo" is in SAFE_BINS, should proceed without approval.
         let result = tool
             .execute(serde_json::json!({ "command": "echo safe" }))
             .await
@@ -353,7 +399,6 @@ mod tests {
 
         let mgr2 = Arc::clone(&mgr);
         let handle = tokio::spawn(async move {
-            // Wait a bit for the request to be created.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let ids = mgr2.pending_ids().await;
             let id = ids.first().unwrap().clone();
@@ -369,10 +414,7 @@ mod tests {
             .execute(serde_json::json!({ "command": "curl http://example.com" }))
             .await;
         handle.await.unwrap();
-        // curl might not be available, but we at least verify the approval path didn't bail.
-        // The broadcast should have been called.
         assert!(bc.called.load(Ordering::SeqCst));
-        // Result could be ok or err depending on curl availability, that's fine.
         let _ = result;
     }
 
@@ -396,5 +438,80 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_with_sandbox() {
+        use crate::sandbox::{NoSandbox, SandboxScope};
+
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "test-session".into(),
+        };
+        let tool = ExecTool::default().with_sandbox(sandbox, id);
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo sandboxed" }))
+            .await
+            .unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "sandboxed");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_cleanup_no_sandbox() {
+        let tool = ExecTool::default();
+        tool.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_cleanup_with_sandbox() {
+        use crate::sandbox::{NoSandbox, SandboxScope};
+
+        let sandbox: Arc<dyn Sandbox> = Arc::new(NoSandbox);
+        let id = SandboxId {
+            scope: SandboxScope::Session,
+            key: "cleanup-test".into(),
+        };
+        let tool = ExecTool::default().with_sandbox(sandbox, id);
+        tool.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_with_sandbox_router_off() {
+        use crate::sandbox::{NoSandbox, SandboxConfig, SandboxRouter};
+
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            Arc::new(NoSandbox),
+        ));
+        let tool = ExecTool::default().with_sandbox_router(router);
+        // No session key → defaults to "main", mode=Off → direct exec.
+        let result = tool
+            .execute(serde_json::json!({ "command": "echo direct" }))
+            .await
+            .unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "direct");
+    }
+
+    #[tokio::test]
+    async fn test_exec_tool_with_sandbox_router_session_key() {
+        use crate::sandbox::{NoSandbox, SandboxConfig, SandboxRouter};
+
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            Arc::new(NoSandbox),
+        ));
+        // Override to enable sandbox for this session (NoSandbox backend → still executes directly).
+        router.set_override("session:abc", true).await;
+        let tool = ExecTool::default().with_sandbox_router(router);
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "echo routed",
+                "_session_key": "session:abc"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "routed");
     }
 }
