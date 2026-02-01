@@ -20,6 +20,10 @@ export function renderMarkdown(raw) {
 
 export function sendRpc(method, params) {
 	return new Promise((resolve) => {
+		if (!S.ws || S.ws.readyState !== WebSocket.OPEN) {
+			resolve({ ok: false, error: { message: "WebSocket not connected" } });
+			return;
+		}
 		var id = nextId();
 		S.pending[id] = resolve;
 		S.ws.send(JSON.stringify({ type: "req", id: id, method: method, params: params }));

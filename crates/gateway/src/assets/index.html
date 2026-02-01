@@ -5,6 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>moltis</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23333'/><text x='16' y='22' font-size='20' text-anchor='middle' fill='white' font-family='system-ui'>M</text></svg>">
+<meta name="build-ts" content="__BUILD_TS__">
+<script type="importmap">
+{
+  "imports": {
+    "preact": "/assets/js/vendor/preact.mjs",
+    "preact/hooks": "/assets/js/vendor/preact-hooks.mjs",
+    "@preact/signals": "/assets/js/vendor/preact-signals.mjs",
+    "htm/preact": "/assets/js/vendor/htm-preact.mjs"
+  }
+}
+</script>
 <link rel="stylesheet" href="/assets/css/base.css">
 <link rel="stylesheet" href="/assets/css/layout.css">
 <link rel="stylesheet" href="/assets/css/chat.css">
@@ -66,11 +78,11 @@
 </header>
 
 <!-- Main layout -->
-<div class="flex flex-1 overflow-hidden">
+<div class="flex flex-1 min-h-0 overflow-hidden">
   <!-- Navigation panel -->
   <nav id="navPanel" class="nav-panel">
     <div class="flex-1 flex flex-col py-1">
-      <a href="/chats" data-nav class="nav-link active" style="display:flex;align-items:center;gap:8px">
+      <a href="/chats" data-nav class="nav-link" style="display:flex;align-items:center;gap:8px">
         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" width="16" height="16"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.076-4.076a1.526 1.526 0 0 1 1.037-.443 48.3 48.3 0 0 0 5.862-.498c1.585-.233 2.708-1.626 2.708-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.4 48.4 0 0 0 12 3a48.4 48.4 0 0 0-5.775.514C4.623 3.746 3.5 5.14 3.5 6.74v6.009Z"/></svg>
         Chat
       </a>
@@ -124,7 +136,7 @@
   </div>
 
   <!-- Page content (swapped by router) -->
-  <div id="pageContent" class="flex-1 flex min-w-0"></div>
+  <div id="pageContent" class="flex-1 flex flex-col min-w-0 overflow-hidden"></div>
 </div>
 
 <!-- Modals (created on demand by modals.js) -->
@@ -170,16 +182,6 @@
   </div>
 </template>
 
-<script type="importmap">
-{
-  "imports": {
-    "preact": "/assets/js/vendor/preact.mjs",
-    "preact/hooks": "/assets/js/vendor/preact-hooks.mjs",
-    "@preact/signals": "/assets/js/vendor/preact-signals.mjs",
-    "htm/preact": "/assets/js/vendor/htm-preact.mjs"
-  }
-}
-</script>
 <script type="module" src="/assets/js/app.js"></script>
 </body>
 </html>

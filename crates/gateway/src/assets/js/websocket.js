@@ -326,7 +326,8 @@ export function connect() {
 			if (hello && hello.type === "hello-ok") {
 				S.setConnected(true);
 				S.setReconnectDelay(1000);
-				setStatus("connected", `connected (v${hello.protocol})`);
+				var assetHash = document.querySelector('meta[name="build-ts"]')?.content || "?";
+				setStatus("connected", `connected (v${hello.protocol}) assets:${assetHash.substring(0, 8)}`);
 				var now = new Date();
 				var ts = now.toLocaleTimeString([], {
 					hour: "2-digit",

@@ -78,6 +78,7 @@ function updateNavActiveState(path) {
 export function mount(path) {
 	teardownCurrentPage();
 	pageContent.textContent = "";
+	pageContent.style.cssText = "";
 	currentPrefix = null;
 
 	var route = findPageRoute(path);

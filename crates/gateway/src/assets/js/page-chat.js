@@ -466,8 +466,8 @@ function handleHistoryDown() {
 
 // Safe: static hardcoded HTML template string — no user input is interpolated.
 var chatPageHTML =
-	'<div class="flex-1 flex flex-col min-w-0">' +
-	'<div class="px-4 py-1.5 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2 shrink-0">' +
+	'<div style="position:absolute;inset:0;display:grid;grid-template-rows:auto 1fr auto auto;overflow:hidden">' +
+	'<div class="px-4 py-1.5 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2">' +
 	'<div id="modelCombo" class="model-combo">' +
 	'<button id="modelComboBtn" class="model-combo-btn" type="button">' +
 	'<span id="modelComboLabel">loading\u2026</span>' +
@@ -483,7 +483,7 @@ var chatPageHTML =
 	'<span id="sandboxLabel">sandboxed</span>' +
 	"</button>" +
 	"</div>" +
-	'<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-2" id="messages"></div>' +
+	'<div class="p-4 flex flex-col gap-2" id="messages" style="overflow-y:auto;min-height:0"></div>' +
 	'<div id="tokenBar" class="token-bar"></div>' +
 	'<div class="px-4 py-3 border-t border-[var(--border)] bg-[var(--surface)] flex gap-2 items-end">' +
 	'<textarea id="chatInput" placeholder="Type a message..." rows="1" ' +
@@ -495,6 +495,7 @@ var chatPageHTML =
 registerPrefix(
 	"/chats",
 	function initChat(container, sessionKeyFromUrl) {
+		container.style.cssText = "position:relative";
 		// Safe: chatPageHTML is a static hardcoded template with no user input.
 		// This is a compile-time constant defined above — no dynamic or user data.
 		container.innerHTML = chatPageHTML; // eslint-disable-line no-unsanitized/property

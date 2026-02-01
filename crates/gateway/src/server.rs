@@ -77,6 +77,7 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
 
     #[cfg(feature = "web-ui")]
     let router = router
+        .route("/assets/v/{version}/{*path}", get(versioned_asset_handler))
         .route("/assets/{*path}", get(asset_handler))
         .route("/api/bootstrap", get(api_bootstrap_handler))
         .route("/api/skills", get(api_skills_handler))
@@ -694,11 +695,27 @@ async fn spa_fallback(uri: axum::http::Uri) -> impl IntoResponse {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
-    let body = ASSETS
-        .get_file("index.html")
-        .map(|f| f.contents_utf8().unwrap_or(""))
-        .unwrap_or("");
-    Html(body).into_response()
+    let raw = read_asset("index.html")
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_default();
+
+    let body = if is_dev_assets() {
+        // Dev: no versioned URLs, just serve directly with no-cache
+        raw.replace("__BUILD_TS__", "dev")
+    } else {
+        // Production: inject content-hash versioned URLs for immutable caching
+        static HASH: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(asset_content_hash);
+        let versioned = format!("/assets/v/{}/", *HASH);
+        raw.replace("__BUILD_TS__", &*HASH)
+            .replace("/assets/", &versioned)
+    };
+
+    (
+        [("cache-control", "no-cache, no-store")],
+        Html(body),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "web-ui")]
@@ -824,9 +841,71 @@ async fn api_skills_search_handler(
 #[cfg(feature = "web-ui")]
 static ASSETS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/assets");
 
+// ── Asset serving: filesystem (dev) or embedded (release) ───────────────────
+
+/// Filesystem path to serve assets from, if available. Checked once at startup.
+/// Set via `MOLTIS_ASSETS_DIR` env var, or auto-detected from the crate source
+/// tree when running via `cargo run`.
 #[cfg(feature = "web-ui")]
-async fn asset_handler(Path(path): Path<String>) -> impl IntoResponse {
-    let mime = match path.rsplit('.').next().unwrap_or("") {
+static FS_ASSETS_DIR: std::sync::LazyLock<Option<std::path::PathBuf>> =
+    std::sync::LazyLock::new(|| {
+        use std::path::PathBuf;
+
+        // Explicit env var takes precedence
+        if let Ok(dir) = std::env::var("MOLTIS_ASSETS_DIR") {
+            let p = PathBuf::from(dir);
+            if p.is_dir() {
+                info!("Serving assets from filesystem: {}", p.display());
+                return Some(p);
+            }
+        }
+
+        // Auto-detect: works when running from the repo via `cargo run`
+        let cargo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets");
+        if cargo_dir.is_dir() {
+            info!("Serving assets from filesystem: {}", cargo_dir.display());
+            return Some(cargo_dir);
+        }
+
+        info!("Serving assets from embedded binary");
+        None
+    });
+
+/// Whether we're serving from the filesystem (dev mode) or embedded (release).
+#[cfg(feature = "web-ui")]
+fn is_dev_assets() -> bool {
+    FS_ASSETS_DIR.is_some()
+}
+
+/// Compute a short content hash of all embedded assets. Only used in release
+/// mode (embedded assets) for cache-busting versioned URLs.
+#[cfg(feature = "web-ui")]
+fn asset_content_hash() -> String {
+    use std::collections::BTreeMap;
+    use std::hash::Hasher;
+
+    let mut files = BTreeMap::new();
+    let mut stack: Vec<&include_dir::Dir<'_>> = vec![&ASSETS];
+    while let Some(dir) = stack.pop() {
+        for file in dir.files() {
+            files.insert(file.path().display().to_string(), file.contents());
+        }
+        for sub in dir.dirs() {
+            stack.push(sub);
+        }
+    }
+
+    let mut h = std::hash::DefaultHasher::new();
+    for (path, contents) in &files {
+        h.write(path.as_bytes());
+        h.write(contents);
+    }
+    format!("{:016x}", h.finish())
+}
+
+#[cfg(feature = "web-ui")]
+fn mime_for_path(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
         "css" => "text/css; charset=utf-8",
         "js" => "application/javascript; charset=utf-8",
         "mjs" => "application/javascript; charset=utf-8",
@@ -838,20 +917,55 @@ async fn asset_handler(Path(path): Path<String>) -> impl IntoResponse {
         "woff2" => "font/woff2",
         "woff" => "font/woff",
         _ => "application/octet-stream",
+    }
+}
+
+/// Read an asset file, preferring filesystem over embedded.
+#[cfg(feature = "web-ui")]
+fn read_asset(path: &str) -> Option<Vec<u8>> {
+    if let Some(dir) = FS_ASSETS_DIR.as_ref() {
+        let file_path = dir.join(path);
+        // Prevent path traversal
+        if file_path.starts_with(dir) {
+            if let Ok(bytes) = std::fs::read(&file_path) {
+                return Some(bytes);
+            }
+        }
+    }
+    ASSETS.get_file(path).map(|f| f.contents().to_vec())
+}
+
+/// Versioned assets: `/assets/v/<hash>/path` — immutable, cached forever.
+#[cfg(feature = "web-ui")]
+async fn versioned_asset_handler(
+    Path((_version, path)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let cache = if is_dev_assets() {
+        "no-cache"
+    } else {
+        "public, max-age=31536000, immutable"
     };
-    match ASSETS.get_file(&path) {
-        Some(file) => {
-            let body = file.contents();
-            (
-                StatusCode::OK,
-                [
-                    ("content-type", mime),
-                    ("cache-control", "public, max-age=3600"),
-                ],
-                body,
-            )
-                .into_response()
-        },
+    serve_asset(&path, cache)
+}
+
+/// Unversioned assets: `/assets/path` — always no-cache.
+#[cfg(feature = "web-ui")]
+async fn asset_handler(Path(path): Path<String>) -> impl IntoResponse {
+    serve_asset(&path, "no-cache")
+}
+
+#[cfg(feature = "web-ui")]
+fn serve_asset(path: &str, cache_control: &'static str) -> axum::response::Response {
+    match read_asset(path) {
+        Some(body) => (
+            StatusCode::OK,
+            [
+                ("content-type", mime_for_path(path)),
+                ("cache-control", cache_control),
+            ],
+            body,
+        )
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }

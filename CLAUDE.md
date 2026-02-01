@@ -29,6 +29,22 @@ cargo run                # Run the project
 cargo run --release      # Run with optimizations
 ```
 
+## Web UI Assets
+
+Assets live in `crates/gateway/src/assets/` (JS, CSS, HTML). The gateway
+serves them in two modes:
+
+- **Dev (filesystem)**: When `cargo run` detects the source tree, assets are
+  served directly from disk. Edit JS/CSS and reload the browser — no Rust
+  recompile needed. You can also set `MOLTIS_ASSETS_DIR` to point elsewhere.
+- **Release (embedded)**: When the binary runs outside the repo, assets are
+  served from the copy embedded at compile time via `include_dir!`. URLs are
+  versioned (`/assets/v/<hash>/...`) with immutable caching; the hash changes
+  automatically on each build.
+
+When editing JavaScript files, run `biome check --write` to lint and format
+them. No separate asset build step is required.
+
 ## Testing
 
 ```bash
@@ -50,9 +66,6 @@ biome check --write      # Lint & format JavaScript files (installed via mise)
 
 When editing `Cargo.toml` or other TOML files, run `taplo fmt` to format them
 according to the project's `taplo.toml` configuration.
-
-When editing JavaScript files, run `biome check --write` to lint and format them.
-Configuration is in `biome.json` at the project root.
 
 ## Provider Implementation Guidelines
 

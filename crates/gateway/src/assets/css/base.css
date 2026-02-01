@@ -378,6 +378,7 @@
   .min-w-0 { min-width: calc(var(--spacing) * 0); }
 
   .flex-1 { flex: 1; }
+  .min-h-0 { min-height: 0; }
   .shrink-0 { flex-shrink: 0; }
   .cursor-pointer { cursor: pointer; }
   .resize { resize: both; }
