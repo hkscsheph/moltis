@@ -39,7 +39,7 @@ use crate::{
     approval::{GatewayApprovalBroadcaster, LiveExecApprovalService},
     auth,
     auth_routes::{AuthState, auth_router},
-    broadcast::broadcast_tick,
+    broadcast::{BroadcastOpts, broadcast, broadcast_tick},
     chat::{LiveChatService, LiveModelService},
     methods::MethodRegistry,
     provider_setup::LiveProviderSetupService,
@@ -49,8 +49,20 @@ use crate::{
     ws::handle_connection,
 };
 
+#[cfg(feature = "tailscale")]
+use crate::tailscale::{
+    CliTailscaleManager, TailscaleManager, TailscaleMode, validate_tailscale_config,
+};
+
 #[cfg(feature = "tls")]
 use crate::tls::CertManager;
+
+/// Options for tailscale serve/funnel passed from CLI flags.
+#[cfg(feature = "tailscale")]
+pub struct TailscaleOpts {
+    pub mode: String,
+    pub reset_on_exit: bool,
+}
 
 // ── Shared app state ─────────────────────────────────────────────────────────
 
@@ -96,6 +108,9 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
             .route("/api/gon", get(api_gon_handler))
             .route("/api/skills", get(api_skills_handler))
             .route("/api/skills/search", get(api_skills_search_handler))
+            .route("/api/mcp", get(api_mcp_handler))
+            .route("/api/plugins", get(api_plugins_handler))
+            .route("/api/plugins/search", get(api_plugins_search_handler))
             .route(
                 "/api/images/cached",
                 get(api_cached_images_handler).delete(api_prune_cached_images_handler),
@@ -129,6 +144,13 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
                 crate::auth_middleware::require_auth,
             ));
 
+        // Mount tailscale routes (protected) when the feature is enabled.
+        #[cfg(feature = "tailscale")]
+        let protected = protected.nest(
+            "/api/tailscale",
+            crate::tailscale_routes::tailscale_router(),
+        );
+
         // Public routes (assets, SPA fallback).
         router
             .route("/assets/v/{version}/{*path}", get(versioned_asset_handler))
@@ -147,6 +169,7 @@ pub async fn start_gateway(
     log_buffer: Option<crate::logs::LogBuffer>,
     config_dir: Option<std::path::PathBuf>,
     data_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "tailscale")] tailscale_opts: Option<TailscaleOpts>,
 ) -> anyhow::Result<()> {
     // Apply config directory override before loading config.
     if let Some(dir) = config_dir {
@@ -198,6 +221,51 @@ pub async fn start_gateway(
     ));
     if !registry.read().await.is_empty() {
         services = services.with_model(Arc::new(LiveModelService::new(Arc::clone(&registry))));
+    }
+
+    // Wire live MCP service.
+    let mcp_configured_count;
+    let live_mcp: Arc<crate::mcp_service::LiveMcpService>;
+    {
+        let mcp_registry_path = moltis_config::data_dir().join("mcp-servers.json");
+        let mcp_reg = moltis_mcp::McpRegistry::load(&mcp_registry_path).unwrap_or_default();
+        // Seed from config file servers that aren't already in the registry.
+        let mut merged = mcp_reg;
+        for (name, entry) in &config.mcp.servers {
+            if !merged.servers.contains_key(name) {
+                let transport = match entry.transport.as_str() {
+                    "sse" => moltis_mcp::registry::TransportType::Sse,
+                    _ => moltis_mcp::registry::TransportType::Stdio,
+                };
+                merged
+                    .servers
+                    .insert(name.clone(), moltis_mcp::McpServerConfig {
+                        command: entry.command.clone(),
+                        args: entry.args.clone(),
+                        env: entry.env.clone(),
+                        enabled: entry.enabled,
+                        transport,
+                        url: entry.url.clone(),
+                    });
+            }
+        }
+        mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
+        let mcp_manager = Arc::new(moltis_mcp::McpManager::new(merged));
+        live_mcp = Arc::new(crate::mcp_service::LiveMcpService::new(Arc::clone(
+            &mcp_manager,
+        )));
+        // Start enabled servers in the background; sync tools once done.
+        let mgr = Arc::clone(&mcp_manager);
+        let mcp_for_sync = Arc::clone(&live_mcp);
+        tokio::spawn(async move {
+            let started = mgr.start_enabled().await;
+            if !started.is_empty() {
+                tracing::info!(servers = ?started, "MCP servers started");
+            }
+            // Sync newly started tools into the agent tool registry.
+            mcp_for_sync.sync_tools_if_ready().await;
+        });
+        services.mcp = live_mcp.clone() as Arc<dyn crate::services::McpService>;
     }
 
     // Initialize data directory and SQLite database.
@@ -490,12 +558,7 @@ pub async fn start_gateway(
         }
     }
 
-    // Wire live session service with sandbox router and project store.
-    services.session = Arc::new(
-        LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
-            .with_sandbox_router(Arc::clone(&sandbox_router))
-            .with_project_store(Arc::clone(&project_store)),
-    );
+    // Session service is wired after hook registry is built (below).
 
     // Wire channel store and Telegram channel service.
     {
@@ -631,6 +694,18 @@ pub async fn start_gateway(
 
         Some(Arc::new(registry))
     };
+
+    // Wire live session service with sandbox router, project store, and hooks.
+    {
+        let mut session_svc =
+            LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
+                .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_project_store(Arc::clone(&project_store));
+        if let Some(ref hooks) = hook_registry {
+            session_svc = session_svc.with_hooks(Arc::clone(hooks));
+        }
+        services.session = Arc::new(session_svc);
+    }
 
     // ── Memory system initialization ─────────────────────────────────────
     let memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>> = {
@@ -793,15 +868,14 @@ pub async fn start_gateway(
                     tracing::warn!("memory migration failed: {e}");
                     None
                 } else {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    let home_memory = directories::ProjectDirs::from("", "", "moltis")
-                        .map(|d| d.data_dir().join("memory"))
-                        .unwrap_or_else(|| std::path::PathBuf::from(".moltis/memory"));
-                    let workspace_memory = cwd.join("memory");
+                    // Scan the data directory for memory files written by the
+                    // silent memory turn (MEMORY.md, memory/*.md).
+                    let data_memory_root = data_dir.clone();
+                    let data_memory_sub = data_dir.join("memory");
 
                     let config = moltis_memory::config::MemoryConfig {
                         db_path: memory_db_path.to_string_lossy().into(),
-                        memory_dirs: vec![workspace_memory, home_memory],
+                        memory_dirs: vec![data_memory_root, data_memory_sub],
                         ..Default::default()
                     };
 
@@ -819,15 +893,27 @@ pub async fn start_gateway(
                     let sync_manager = Arc::clone(&manager);
                     tokio::spawn(async move {
                         match sync_manager.sync().await {
-                            Ok(report) => info!(
-                                updated = report.files_updated,
-                                unchanged = report.files_unchanged,
-                                removed = report.files_removed,
-                                errors = report.errors,
-                                cache_hits = report.cache_hits,
-                                cache_misses = report.cache_misses,
-                                "memory: initial sync complete"
-                            ),
+                            Ok(report) => {
+                                info!(
+                                    updated = report.files_updated,
+                                    unchanged = report.files_unchanged,
+                                    removed = report.files_removed,
+                                    errors = report.errors,
+                                    cache_hits = report.cache_hits,
+                                    cache_misses = report.cache_misses,
+                                    "memory: initial sync complete"
+                                );
+                                match sync_manager.status().await {
+                                    Ok(status) => info!(
+                                        files = status.total_files,
+                                        chunks = status.total_chunks,
+                                        db_size = %status.db_size_display(),
+                                        model = %status.embedding_model,
+                                        "memory: status"
+                                    ),
+                                    Err(e) => tracing::warn!("memory: failed to get status: {e}"),
+                                }
+                            },
                             Err(e) => tracing::warn!("memory: initial sync failed: {e}"),
                         }
 
@@ -908,6 +994,10 @@ pub async fn start_gateway(
     };
 
     let is_localhost = matches!(bind, "127.0.0.1" | "::1" | "localhost");
+    #[cfg(feature = "tls")]
+    let tls_active_for_state = config.tls.enabled;
+    #[cfg(not(feature = "tls"))]
+    let tls_active_for_state = false;
     let state = GatewayState::with_options(
         resolved_auth,
         services,
@@ -916,8 +1006,10 @@ pub async fn start_gateway(
         Some(Arc::clone(&credential_store)),
         webauthn_state,
         is_localhost,
+        tls_active_for_state,
         hook_registry.clone(),
         memory_manager.clone(),
+        port,
     );
 
     // Generate a one-time setup code if setup is pending and auth is not disabled.
@@ -929,6 +1021,27 @@ pub async fn start_gateway(
         } else {
             None
         };
+
+    // ── Tailscale Serve/Funnel ─────────────────────────────────────────
+    #[cfg(feature = "tailscale")]
+    let tailscale_mode: TailscaleMode = {
+        // CLI flag overrides config file.
+        let mode_str = tailscale_opts
+            .as_ref()
+            .map(|o| o.mode.clone())
+            .unwrap_or_else(|| config.tailscale.mode.clone());
+        mode_str.parse().unwrap_or(TailscaleMode::Off)
+    };
+    #[cfg(feature = "tailscale")]
+    let tailscale_reset_on_exit = tailscale_opts
+        .as_ref()
+        .map(|o| o.reset_on_exit)
+        .unwrap_or(config.tailscale.reset_on_exit);
+
+    #[cfg(feature = "tailscale")]
+    if tailscale_mode != TailscaleMode::Off {
+        validate_tailscale_config(tailscale_mode, bind, credential_store.is_setup_complete())?;
+    }
 
     // Populate the deferred reference so cron callbacks can reach the gateway.
     let _ = deferred_state.set(Arc::clone(&state));
@@ -966,13 +1079,62 @@ pub async fn start_gateway(
                 Arc::clone(mm),
             )));
         }
+
+        // Register spawn_agent tool for sub-agent support.
+        // The tool gets a snapshot of the current registry (without itself)
+        // so sub-agents have access to all other tools.
+        if let Some(default_provider) = registry.read().await.first_with_tools() {
+            let base_tools = Arc::new(tool_registry.clone_without(&[]));
+            let state_for_spawn = Arc::clone(&state);
+            let on_spawn_event: moltis_tools::spawn_agent::OnSpawnEvent = Arc::new(move |event| {
+                use moltis_agents::runner::RunnerEvent;
+                let state = Arc::clone(&state_for_spawn);
+                let payload = match &event {
+                    RunnerEvent::SubAgentStart { task, model, depth } => {
+                        serde_json::json!({
+                            "state": "sub_agent_start",
+                            "task": task,
+                            "model": model,
+                            "depth": depth,
+                        })
+                    },
+                    RunnerEvent::SubAgentEnd {
+                        task,
+                        model,
+                        depth,
+                        iterations,
+                        tool_calls_made,
+                    } => serde_json::json!({
+                        "state": "sub_agent_end",
+                        "task": task,
+                        "model": model,
+                        "depth": depth,
+                        "iterations": iterations,
+                        "toolCallsMade": tool_calls_made,
+                    }),
+                    _ => return, // Only broadcast sub-agent lifecycle events.
+                };
+                tokio::spawn(async move {
+                    broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
+                });
+            });
+            let spawn_tool = moltis_tools::spawn_agent::SpawnAgentTool::new(
+                Arc::clone(&registry),
+                default_provider,
+                base_tools,
+            )
+            .with_on_event(on_spawn_event);
+            tool_registry.register(Box::new(spawn_tool));
+        }
+
+        let shared_tool_registry = Arc::new(tokio::sync::RwLock::new(tool_registry));
         let mut chat_service = LiveChatService::new(
             Arc::clone(&registry),
             Arc::clone(&state),
             Arc::clone(&session_store),
             Arc::clone(&session_metadata),
         )
-        .with_tools(tool_registry);
+        .with_tools(Arc::clone(&shared_tool_registry));
 
         if let Some(ref hooks) = state.hook_registry {
             chat_service = chat_service.with_hooks_arc(Arc::clone(hooks));
@@ -980,6 +1142,22 @@ pub async fn start_gateway(
 
         let live_chat = Arc::new(chat_service);
         state.set_chat(live_chat).await;
+
+        // Store registry in the MCP service so runtime mutations auto-sync,
+        // and do an initial sync for any servers that already started.
+        live_mcp
+            .set_tool_registry(Arc::clone(&shared_tool_registry))
+            .await;
+        crate::mcp_service::sync_mcp_tools(live_mcp.manager(), &shared_tool_registry).await;
+    }
+
+    // Spawn MCP health polling + auto-restart background task.
+    {
+        let health_state = Arc::clone(&state);
+        let health_mcp = Arc::clone(&live_mcp);
+        tokio::spawn(async move {
+            crate::mcp_health::run_health_monitor(health_state, health_mcp).await;
+        });
     }
 
     let methods = Arc::new(MethodRegistry::new());
@@ -1078,10 +1256,15 @@ pub async fn start_gateway(
     let mut lines = vec![
         format!("moltis gateway v{}", state.version),
         format!(
-            "protocol v{}, listening on {}://{}",
+            "protocol v{}, listening on {}://{} ({})",
             moltis_protocol::PROTOCOL_VERSION,
             scheme,
             addr,
+            if tls_active {
+                "HTTP/2 + HTTP/1.1"
+            } else {
+                "HTTP/1.1"
+            },
         ),
         format!("{} methods registered", methods.method_names().len()),
         format!("llm: {}", provider_summary),
@@ -1093,6 +1276,15 @@ pub async fn start_gateway(
                 ""
             } else {
                 "s"
+            }
+        ),
+        format!(
+            "mcp: {} configured{}",
+            mcp_configured_count,
+            if mcp_configured_count > 0 {
+                " (starting in background)"
+            } else {
+                ""
             }
         ),
         format!("sandbox: {} backend", sandbox_router.backend_name()),
@@ -1131,6 +1323,31 @@ pub async fn start_gateway(
         }
         lines.push("run `moltis trust-ca` to remove browser warnings".into());
     }
+    // Tailscale: enable serve/funnel and show in banner.
+    #[cfg(feature = "tailscale")]
+    {
+        if tailscale_mode != TailscaleMode::Off {
+            let manager = CliTailscaleManager::new();
+            let ts_result = match tailscale_mode {
+                TailscaleMode::Serve => manager.enable_serve(port, tls_active).await,
+                TailscaleMode::Funnel => manager.enable_funnel(port, tls_active).await,
+                TailscaleMode::Off => unreachable!(),
+            };
+            match ts_result {
+                Ok(()) => {
+                    if let Ok(Some(hostname)) = manager.hostname().await {
+                        lines.push(format!("tailscale {tailscale_mode}: https://{hostname}"));
+                    } else {
+                        lines.push(format!("tailscale {tailscale_mode}: enabled"));
+                    }
+                },
+                Err(e) => {
+                    warn!("failed to enable tailscale {tailscale_mode}: {e}");
+                    lines.push(format!("tailscale {tailscale_mode}: FAILED ({e})"));
+                },
+            }
+        }
+    }
     let width = lines.iter().map(|l| l.len()).max().unwrap_or(0) + 4;
     info!("┌{}┐", "─".repeat(width));
     for line in &lines {
@@ -1146,6 +1363,22 @@ pub async fn start_gateway(
         if let Err(e) = hooks.dispatch(&payload).await {
             tracing::warn!("GatewayStart hook dispatch failed: {e}");
         }
+    }
+
+    // Register tailscale shutdown hook (reset serve/funnel on exit).
+    #[cfg(feature = "tailscale")]
+    if tailscale_mode != TailscaleMode::Off && tailscale_reset_on_exit {
+        let ts_mode = tailscale_mode;
+        tokio::spawn(async move {
+            // Wait for ctrl-c or shutdown signal.
+            tokio::signal::ctrl_c().await.ok();
+            info!("shutting down tailscale {ts_mode}");
+            let manager = CliTailscaleManager::new();
+            if let Err(e) = manager.disable().await {
+                warn!("failed to reset tailscale on exit: {e}");
+            }
+            std::process::exit(0);
+        });
     }
 
     // Spawn tick timer.
@@ -1399,10 +1632,29 @@ fn is_same_origin(origin: &str, host: &str) -> bool {
 #[derive(serde::Serialize)]
 struct GonData {
     identity: moltis_config::ResolvedIdentity,
+    port: u16,
+    counts: NavCounts,
+    crons: Vec<moltis_cron::types::CronJob>,
+    cron_status: moltis_cron::types::CronStatus,
+}
+
+/// Counts shown as badges in the sidebar navigation.
+#[cfg(feature = "web-ui")]
+#[derive(Debug, Default, serde::Serialize)]
+struct NavCounts {
+    projects: usize,
+    providers: usize,
+    channels: usize,
+    plugins: usize,
+    skills: usize,
+    mcp: usize,
+    crons: usize,
+    images: usize,
 }
 
 #[cfg(feature = "web-ui")]
 async fn build_gon_data(gw: &GatewayState) -> GonData {
+    let port = gw.port;
     let identity = gw
         .services
         .onboarding
@@ -1411,7 +1663,141 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    GonData { identity }
+
+    let counts = build_nav_counts(gw).await;
+    let (crons, cron_status) = tokio::join!(gw.services.cron.list(), gw.services.cron.status());
+    let crons: Vec<moltis_cron::types::CronJob> = crons
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let cron_status: moltis_cron::types::CronStatus = cron_status
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    GonData {
+        identity,
+        port,
+        counts,
+        crons,
+        cron_status,
+    }
+}
+
+#[cfg(feature = "web-ui")]
+async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
+    let (projects, models, channels, mcp, crons, images) = tokio::join!(
+        gw.services.project.list(),
+        gw.services.model.list(),
+        gw.services.channel.status(),
+        gw.services.mcp.list(),
+        gw.services.cron.list(),
+        async {
+            let builder = moltis_tools::image_cache::DockerImageBuilder::new();
+            builder.list_cached().await.ok()
+        },
+    );
+
+    let projects = projects
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+
+    let providers = models
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for m in arr {
+                    if let Some(p) = m.get("provider").and_then(|p| p.as_str()) {
+                        names.insert(p);
+                    }
+                }
+                names.len()
+            })
+        })
+        .unwrap_or(0);
+
+    let channels = channels
+        .ok()
+        .and_then(|v| {
+            v.get("channels")
+                .and_then(|c| c.as_array())
+                .map(|a| a.len())
+        })
+        .unwrap_or(0);
+
+    // Count enabled skills from both skills and plugins manifests (same logic as
+    // api_skills_handler) — the SkillsService::status() noop returns an empty list,
+    // so we read the manifests directly.
+    let mut skills = 0usize;
+    if let Ok(path) = moltis_skills::manifest::ManifestStore::default_path() {
+        let store = moltis_skills::manifest::ManifestStore::new(path);
+        if let Ok(m) = store.load() {
+            skills += m
+                .repos
+                .iter()
+                .flat_map(|r| &r.skills)
+                .filter(|s| s.enabled)
+                .count();
+        }
+    }
+    if let Ok(path) = moltis_plugins::install::default_manifest_path() {
+        let store = moltis_skills::manifest::ManifestStore::new(path);
+        if let Ok(m) = store.load() {
+            skills += m
+                .repos
+                .iter()
+                .flat_map(|r| &r.skills)
+                .filter(|s| s.enabled)
+                .count();
+        }
+    }
+    let plugins = 0usize;
+
+    // Count plugins repos separately.
+    let plugins = gw
+        .services
+        .plugins
+        .repos_list()
+        .await
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(plugins);
+
+    let mcp = mcp
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter(|s| s.get("state").and_then(|s| s.as_str()) == Some("running"))
+                    .count()
+            })
+        })
+        .unwrap_or(0);
+
+    let crons = crons
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter(|j| j.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false))
+                    .count()
+            })
+        })
+        .unwrap_or(0);
+
+    let images = images.map(|imgs| imgs.len()).unwrap_or(0);
+
+    NavCounts {
+        projects,
+        providers,
+        channels,
+        plugins,
+        skills,
+        mcp,
+        crons,
+        images,
+    }
 }
 
 #[cfg(feature = "web-ui")]
@@ -1449,6 +1835,8 @@ async fn spa_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> im
     };
 
     // Inject gon data into <head> so it's available before any module scripts run.
+    // An inline <script> in the <body> (right after the title elements) reads
+    // window.__MOLTIS__.identity to set emoji/name before the first paint.
     let body = body.replace("</head>", &format!("{gon_script}\n</head>"));
 
     ([("cache-control", "no-cache, no-store")], Html(body)).into_response()
@@ -1485,6 +1873,7 @@ async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRespon
             "default_image": moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE,
         })
     };
+    let counts = build_nav_counts(gw).await;
     Json(serde_json::json!({
         "channels": channels.ok(),
         "sessions": sessions.ok(),
@@ -1493,126 +1882,100 @@ async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRespon
         "onboarded": onboarded,
         "identity": identity,
         "sandbox": sandbox,
+        "counts": counts,
     }))
+}
+
+/// MCP servers list for the UI (HTTP endpoint for initial page load).
+#[cfg(feature = "web-ui")]
+async fn api_mcp_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let servers = state.gateway.services.mcp.list().await;
+    match servers {
+        Ok(val) => axum::Json(val).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 /// Lightweight skills overview: repo summaries + enabled skills only.
 /// Full skill lists are loaded on-demand via /api/skills/search.
-/// Merges both skills and plugins manifests for the UI.
+/// Returns enabled skills from the skills manifest and skill repos.
 #[cfg(feature = "web-ui")]
-async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let gw = &state.gateway;
-
-    // Skill repos
-    let skill_repos = gw
-        .services
-        .skills
-        .repos_list()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    // Plugin repos
-    let plugin_repos = gw
-        .services
-        .plugins
-        .repos_list()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    let mut all_repos = skill_repos;
-    all_repos.extend(plugin_repos);
-
-    // Enabled skills from skills manifest
-    let mut enabled_skills: Vec<serde_json::Value> =
-        if let Ok(path) = moltis_skills::manifest::ManifestStore::default_path() {
-            let store = moltis_skills::manifest::ManifestStore::new(path);
-            store
-                .load()
-                .map(|m| {
-                    m.repos
-                        .iter()
-                        .flat_map(|repo| {
-                            let source = repo.source.clone();
-                            repo.skills.iter().filter(|s| s.enabled).map(move |s| {
-                                serde_json::json!({
-                                    "name": s.name,
-                                    "source": source,
-                                    "enabled": true,
-                                })
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-    // Enabled skills from plugins manifest
-    if let Ok(path) = moltis_plugins::install::default_manifest_path() {
-        let store = moltis_skills::manifest::ManifestStore::new(path);
-        if let Ok(m) = store.load() {
-            for repo in &m.repos {
-                let source = repo.source.clone();
-                for s in &repo.skills {
-                    if s.enabled {
-                        enabled_skills.push(serde_json::json!({
+fn enabled_from_manifest(
+    path_result: anyhow::Result<std::path::PathBuf>,
+) -> Vec<serde_json::Value> {
+    let Ok(path) = path_result else {
+        return Vec::new();
+    };
+    let store = moltis_skills::manifest::ManifestStore::new(path);
+    store
+        .load()
+        .map(|m| {
+            m.repos
+                .iter()
+                .flat_map(|repo| {
+                    let source = repo.source.clone();
+                    repo.skills.iter().filter(|s| s.enabled).map(move |s| {
+                        serde_json::json!({
                             "name": s.name,
                             "source": source,
                             "enabled": true,
-                        }));
-                    }
-                }
-            }
-        }
-    }
+                        })
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-    Json(serde_json::json!({
-        "skills": enabled_skills,
-        "repos": all_repos,
-    }))
+/// Skills endpoint: repos and enabled skills from the skills manifest only.
+#[cfg(feature = "web-ui")]
+async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let repos = state
+        .gateway
+        .services
+        .skills
+        .repos_list()
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let skills = enabled_from_manifest(moltis_skills::manifest::ManifestStore::default_path());
+
+    Json(serde_json::json!({ "skills": skills, "repos": repos }))
+}
+
+/// Plugins endpoint: repos and enabled skills from the plugins manifest only.
+#[cfg(feature = "web-ui")]
+async fn api_plugins_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let repos = state
+        .gateway
+        .services
+        .plugins
+        .repos_list()
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let skills = enabled_from_manifest(moltis_plugins::install::default_manifest_path());
+
+    Json(serde_json::json!({ "skills": skills, "repos": repos }))
 }
 
 /// Search skills within a specific repo. Query params: source, q (optional).
-/// If q is empty, returns all skills for the repo. Searches both skills and plugins.
 #[cfg(feature = "web-ui")]
-async fn api_skills_search_handler(
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let source = params.get("source").cloned().unwrap_or_default();
-    let query = params.get("q").cloned().unwrap_or_default().to_lowercase();
-
-    let gw = &state.gateway;
-
-    // Search skills repos first.
-    let skill_repos = gw
-        .services
-        .skills
-        .repos_list_full()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    // Search plugins repos.
-    let plugin_repos = gw
-        .services
-        .plugins
-        .repos_list_full()
-        .await
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
-    let mut all_repos = skill_repos;
-    all_repos.extend(plugin_repos);
-
-    let skills: Vec<serde_json::Value> = all_repos
+async fn api_search_handler(
+    repos: Vec<serde_json::Value>,
+    source: &str,
+    query: &str,
+) -> Json<serde_json::Value> {
+    let query = query.to_lowercase();
+    let skills: Vec<serde_json::Value> = repos
         .into_iter()
         .find(|repo| {
             repo.get("source")
@@ -1648,6 +2011,44 @@ async fn api_skills_search_handler(
         .collect();
 
     Json(serde_json::json!({ "skills": skills }))
+}
+
+#[cfg(feature = "web-ui")]
+async fn api_skills_search_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let source = params.get("source").cloned().unwrap_or_default();
+    let query = params.get("q").cloned().unwrap_or_default();
+    let repos = state
+        .gateway
+        .services
+        .skills
+        .repos_list_full()
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    api_search_handler(repos, &source, &query).await
+}
+
+#[cfg(feature = "web-ui")]
+async fn api_plugins_search_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let source = params.get("source").cloned().unwrap_or_default();
+    let query = params.get("q").cloned().unwrap_or_default();
+    let repos = state
+        .gateway
+        .services
+        .plugins
+        .repos_list_full()
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    api_search_handler(repos, &source, &query).await
 }
 
 /// List cached tool images.

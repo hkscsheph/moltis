@@ -44,10 +44,16 @@ pub struct TelegramAccountConfig {
     /// Minimum interval between edit-in-place updates (ms).
     pub edit_throttle_ms: u64,
 
-    /// Default model ID for this bot's sessions (e.g. "openai/gpt-4o").
+    /// Default model ID for this bot's sessions (e.g. "claude-sonnet-4-5-20250929").
     /// When set, channel messages use this model instead of the first registered provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+
+    /// Provider name associated with `model` (e.g. "anthropic").
+    /// Stored alongside the model ID for display and debugging; the registry
+    /// resolves the provider from the model ID at runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
 }
 
 impl std::fmt::Debug for TelegramAccountConfig {
@@ -79,6 +85,7 @@ impl Default for TelegramAccountConfig {
             stream_mode: StreamMode::default(),
             edit_throttle_ms: 300,
             model: None,
+            model_provider: None,
         }
     }
 }

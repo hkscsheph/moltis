@@ -5,7 +5,13 @@ import { formatBytes, formatTokens, renderMarkdown, sendRpc } from "./helpers.js
 import { bindModelComboEvents, setSessionModel } from "./models.js";
 import { registerPrefix, sessionPath } from "./router.js";
 import { bindSandboxImageEvents, bindSandboxToggleEvents, updateSandboxImageUI, updateSandboxUI } from "./sandbox.js";
-import { bumpSessionCount, setSessionReplying, switchSession } from "./sessions.js";
+import {
+	bumpSessionCount,
+	fetchSessions,
+	setSessionReplying,
+	switchSession,
+	updateChatSessionHeader,
+} from "./sessions.js";
 import * as S from "./state.js";
 
 // ── Slash commands ───────────────────────────────────────
@@ -249,6 +255,29 @@ function renderContextSkillsSection(card, data) {
 	card.appendChild(skillsSection);
 }
 
+function renderContextMcpSection(card, data) {
+	var servers = data.mcpServers || [];
+	var section = ctxSection("MCP Tools");
+	var running = servers.filter((s) => s.state === "running");
+	if (running.length > 0) {
+		var wrap = ctxEl("div", "");
+		wrap.className = "ctx-tool-wrap";
+		running.forEach((s) => {
+			var tag = ctxEl("span", "ctx-tag");
+			var dot = ctxEl("span", "ctx-tag-dot");
+			dot.style.background = "var(--ok)";
+			tag.appendChild(dot);
+			tag.appendChild(document.createTextNode(s.name));
+			tag.title = `${s.tool_count} tool${s.tool_count !== 1 ? "s" : ""} — ${s.state}`;
+			wrap.appendChild(tag);
+		});
+		section.appendChild(wrap);
+	} else {
+		section.appendChild(ctxEl("div", "ctx-empty", "No MCP tools running"));
+	}
+	card.appendChild(section);
+}
+
 function renderContextSandboxSection(card, data) {
 	var sb = data.sandbox || {};
 	var sandboxSection = ctxSection("Sandbox");
@@ -311,6 +340,7 @@ function renderContextCard(data) {
 	renderContextSessionSection(card, data);
 	renderContextProjectSection(card, data);
 	renderContextSkillsSection(card, data);
+	renderContextMcpSection(card, data);
 	renderContextToolsSection(card, data);
 	renderContextSandboxSection(card, data);
 	renderContextTokensSection(card, data);
@@ -383,7 +413,7 @@ function handleSlashCommand(cmdName) {
 				if (S.chatMsgBox) S.chatMsgBox.textContent = "";
 				S.setSessionTokens({ input: 0, output: 0 });
 				updateTokenBar();
-				bumpSessionCount(S.activeSessionKey, 0);
+				fetchSessions();
 			} else {
 				chatAddMsg("error", res?.error?.message || "Clear failed");
 			}
@@ -514,6 +544,11 @@ var chatPageHTML =
 	"</button>" +
 	'<div id="sandboxImageDropdown" class="hidden" style="position:absolute;top:100%;left:0;z-index:50;margin-top:4px;min-width:200px;max-height:300px;overflow-y:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.15);"></div>' +
 	"</div>" +
+	'<div class="ml-auto flex items-center gap-1.5">' +
+	'<span id="chatSessionName" class="text-xs text-[var(--muted)] cursor-default" title="Click to rename"></span>' +
+	'<input id="chatSessionRenameInput" class="hidden text-xs text-[var(--text)] bg-[var(--surface2)] border border-[var(--border)] rounded-[var(--radius-sm)] px-1.5 py-0.5 outline-none max-w-[200px]" style="width:0" />' +
+	'<button id="chatSessionDelete" class="provider-btn provider-btn-danger provider-btn-sm hidden">Delete</button>' +
+	"</div>" +
 	"</div>" +
 	'<div class="p-4 flex flex-col gap-2" id="messages" style="overflow-y:auto;min-height:0"></div>' +
 	'<div id="tokenBar" class="token-bar"></div>' +
@@ -521,7 +556,7 @@ var chatPageHTML =
 	'<textarea id="chatInput" placeholder="Type a message..." rows="1" ' +
 	'class="flex-1 bg-[var(--surface2)] border border-[var(--border)] text-[var(--text)] px-3 py-2 rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] leading-relaxed focus:outline-none focus:border-[var(--border-strong)] focus:ring-1 focus:ring-[var(--accent-subtle)] transition-colors font-[var(--font-body)]"></textarea>' +
 	'<button id="sendBtn" disabled ' +
-	'class="bg-[var(--accent-dim)] text-white border-none px-4 py-2 rounded-lg cursor-pointer text-sm font-medium whitespace-nowrap hover:bg-[var(--accent)] disabled:opacity-40 disabled:cursor-default transition-colors">Send</button>' +
+	'class="provider-btn min-h-[40px] disabled:opacity-40 disabled:cursor-default">Send</button>' +
 	"</div></div>";
 
 registerPrefix(
@@ -554,6 +589,7 @@ registerPrefix(
 		S.setSandboxImageDropdown(S.$("sandboxImageDropdown"));
 		bindSandboxImageEvents();
 		updateSandboxImageUI(null);
+		updateChatSessionHeader();
 
 		if (S.models.length > 0 && S.modelComboLabel) {
 			var found = S.models.find((m) => m.id === S.selectedModelId);

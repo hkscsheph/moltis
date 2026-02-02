@@ -35,7 +35,8 @@ What you get out of the box:
   after a cooldown — no manual intervention.
 - **Auto-compaction** — When a conversation approaches 95 % of the model's
   context window, history is summarized and important facts are persisted to
-  the memory store. No manual truncation.
+  the memory store. On context-window-exceeded errors the agent loop
+  automatically compacts and retries once.
 
 ## Features
 
@@ -46,8 +47,18 @@ What you get out of the box:
 - **Communication channels** — Telegram integration with an extensible channel
   abstraction for adding others
 - **Web gateway** — HTTP and WebSocket server with a built-in web UI
-- **Session persistence** — SQLite-backed conversation history and session
-  management
+- **Session persistence** — SQLite-backed conversation history, session
+  management, and per-session run serialization to prevent history corruption
+- **Agent-level timeout** — configurable wall-clock timeout for agent runs
+  (default 600s) to prevent runaway executions
+- **Sub-agent delegation** — `spawn_agent` tool lets the LLM delegate tasks to
+  child agent loops with nesting depth limits and tool filtering
+- **Message queue modes** — `followup` (replay each queued message as a
+  separate run) or `collect` (concatenate and send once) when messages arrive
+  during an active run
+- **Tool result sanitization** — strips base64 data URIs and long hex blobs,
+  truncates oversized results before feeding back to the LLM (configurable
+  limit, default 50 KB)
 - **Memory and knowledge base** — embeddings-powered long-term memory
 - **Skills and plugins** — extensible skill system and plugin architecture
 - **Hook system** — lifecycle hooks with priority ordering, parallel dispatch
@@ -60,6 +71,11 @@ What you get out of the box:
 - **OAuth flows** — built-in OAuth2 for provider authentication
 - **TLS support** — automatic self-signed certificate generation
 - **Observability** — OpenTelemetry tracing with OTLP export
+- **MCP (Model Context Protocol) support** — connect to MCP tool servers over
+  stdio or HTTP/SSE (remote servers), with health polling, automatic restart
+  on crash (exponential backoff), and in-UI server config editing
+- **Parallel tool execution** — when the LLM requests multiple tool calls in
+  one turn, they run concurrently via `futures::join_all`, reducing latency
 - **Sandboxed execution** — Docker and Apple Container backends with pre-built
   images, configurable packages, and per-session isolation
 - **Authentication** — password and passkey (WebAuthn) authentication with
@@ -72,6 +88,9 @@ What you get out of the box:
   defaults so you can edit packages and settings without recompiling
 - **Configurable directories** — `--config-dir` / `--data-dir` CLI flags and
   `MOLTIS_CONFIG_DIR` / `MOLTIS_DATA_DIR` environment variables
+- **Tailscale integration** — expose the gateway over your tailnet via Tailscale
+  Serve (private HTTPS) or Funnel (public HTTPS), with status monitoring and
+  mode switching from the web UI (optional `tailscale` feature flag)
 
 ## Quickstart
 
@@ -340,7 +359,8 @@ env = { DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..." }
 ```
 
 See `examples/hooks/` for ready-to-use scripts (logging, blocking dangerous
-commands, Slack/Discord notifications, secret redaction, session saving).
+commands, content filtering, agent metrics, message audit trail,
+Slack/Discord notifications, secret redaction, session saving).
 
 ### Sandbox Image Management
 
@@ -371,6 +391,7 @@ Moltis is organized as a Cargo workspace with the following crates:
 | `moltis-sessions` | Session persistence |
 | `moltis-memory` | Embeddings-based knowledge base |
 | `moltis-skills` | Skill/plugin system |
+| `moltis-mcp` | MCP client, transport, and tool bridge |
 | `moltis-plugins` | Plugin formats, hook handlers, and shell hook runtime |
 | `moltis-tools` | Tool/function execution |
 | `moltis-routing` | Message routing |

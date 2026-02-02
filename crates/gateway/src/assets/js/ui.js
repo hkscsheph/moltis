@@ -2,7 +2,7 @@
 
 import { signal } from "@preact/signals";
 import { html } from "htm/preact";
-import { useEffect } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 
 // ── Toast notifications ──────────────────────────────────────
 export var toasts = signal([]);
@@ -96,4 +96,149 @@ export function ConfirmDialog() {
       <button onClick=${yes} class="provider-btn">Confirm</button>
     </div>
   </${Modal}>`;
+}
+
+/**
+ * Vanilla-JS confirm dialog (no Preact needed).
+ * Returns a Promise<boolean> — true if confirmed, false if cancelled.
+ * Safe: all content set via textContent, no user input in markup.
+ */
+export function confirmDialog(message) {
+	return new Promise((resolve) => {
+		var backdrop = document.createElement("div");
+		backdrop.className = "provider-modal-backdrop";
+
+		var box = document.createElement("div");
+		box.className = "provider-modal";
+		box.style.width = "360px";
+
+		var body = document.createElement("div");
+		body.className = "provider-modal-body";
+		body.style.gap = "16px";
+
+		var msg = document.createElement("p");
+		msg.style.cssText = "font-size:.85rem;color:var(--text);margin:0";
+		msg.textContent = message;
+
+		var btnRow = document.createElement("div");
+		btnRow.style.cssText = "display:flex;gap:8px;justify-content:flex-end";
+
+		var cancelBtn = document.createElement("button");
+		cancelBtn.className = "provider-btn provider-btn-secondary";
+		cancelBtn.textContent = "Cancel";
+
+		var deleteBtn = document.createElement("button");
+		deleteBtn.className = "provider-btn provider-btn-danger";
+		deleteBtn.textContent = "Delete";
+
+		function close(val) {
+			backdrop.remove();
+			resolve(val);
+		}
+		cancelBtn.addEventListener("click", () => close(false));
+		deleteBtn.addEventListener("click", () => close(true));
+		backdrop.addEventListener("click", (e) => {
+			if (e.target === backdrop) close(false);
+		});
+
+		btnRow.appendChild(cancelBtn);
+		btnRow.appendChild(deleteBtn);
+		body.appendChild(msg);
+		body.appendChild(btnRow);
+		box.appendChild(body);
+		backdrop.appendChild(box);
+		document.body.appendChild(backdrop);
+		deleteBtn.focus();
+	});
+}
+
+// ── Model select dropdown (Preact, reuses .model-combo CSS) ──
+export function ModelSelect({ models, value, onChange, placeholder }) {
+	var [open, setOpen] = useState(false);
+	var [query, setQuery] = useState("");
+	var [kbIndex, setKbIndex] = useState(-1);
+	var ref = useRef(null);
+	var searchRef = useRef(null);
+	var listRef = useRef(null);
+
+	var selected = models.find((m) => m.id === value);
+	var label = selected ? selected.displayName || selected.id : placeholder || "(none)";
+
+	var filtered = models.filter((m) => {
+		if (!query) return true;
+		var q = query.toLowerCase();
+		return (
+			(m.displayName || "").toLowerCase().includes(q) ||
+			m.id.toLowerCase().includes(q) ||
+			(m.provider || "").toLowerCase().includes(q)
+		);
+	});
+
+	useEffect(() => {
+		if (!open) return;
+		function onClick(e) {
+			if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+		}
+		document.addEventListener("mousedown", onClick);
+		return () => document.removeEventListener("mousedown", onClick);
+	}, [open]);
+
+	useEffect(() => {
+		if (open && searchRef.current) searchRef.current.focus();
+	}, [open]);
+
+	useEffect(() => {
+		setKbIndex(-1);
+	}, [query]);
+
+	function onKeyDown(e) {
+		if (e.key === "Escape") {
+			setOpen(false);
+		} else if (e.key === "ArrowDown") {
+			e.preventDefault();
+			setKbIndex((i) => Math.min(i + 1, filtered.length - 1));
+		} else if (e.key === "ArrowUp") {
+			e.preventDefault();
+			setKbIndex((i) => Math.max(i - 1, 0));
+		} else if (e.key === "Enter") {
+			e.preventDefault();
+			var idx = kbIndex >= 0 ? kbIndex : 0;
+			if (filtered[idx]) pick(filtered[idx]);
+		}
+	}
+
+	function pick(m) {
+		onChange(m ? m.id : "");
+		setOpen(false);
+		setQuery("");
+	}
+
+	return html`<div class="model-combo" ref=${ref} style="width:100%;">
+    <button type="button" class="model-combo-btn" style="width:100%;" onClick=${() => setOpen(!open)}>
+      <span class="model-item-label">${label}</span>
+      <svg class="model-combo-chevron" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 5l3 3 3-3"/></svg>
+    </button>
+    ${
+			open &&
+			html`<div class="model-dropdown" style="width:100%;" onKeyDown=${onKeyDown}>
+      <input class="model-search-input" ref=${searchRef} placeholder="Search models\u2026"
+        value=${query} onInput=${(e) => setQuery(e.target.value)} />
+      <div class="model-dropdown-list" ref=${listRef}>
+        <div class="model-dropdown-item ${value ? "" : "selected"}"
+          onClick=${() => pick(null)}>
+          <span class="model-item-label">${placeholder || "(none)"}</span>
+        </div>
+        ${filtered.map(
+					(m, i) => html`<div key=${m.id}
+            class="model-dropdown-item ${m.id === value ? "selected" : ""} ${i === kbIndex ? "kb-active" : ""}"
+            onClick=${() => pick(m)}>
+            <span class="model-item-label">${m.displayName || m.id}</span>
+            ${m.provider && html`<span class="model-item-provider">${m.provider}</span>`}
+          </div>`,
+				)}
+        ${filtered.length === 0 && html`<div class="model-dropdown-empty">No matches</div>`}
+      </div>
+    </div>`
+		}
+  </div>`;
 }

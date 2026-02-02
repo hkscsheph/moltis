@@ -12,13 +12,59 @@ many features it has. `../clawdbot/HOWITWORKS.md` has explaination of how it
 works. But feel free to do any improvement and change the way it is to make
 it more Rustacean.
 
-Always use traits if possible, to allow other implementations.
+All code you write must have tests with high coverage.
 
-Always prefer streaming over non-streaming API calls when possible. Streaming
-provides a better, friendlier user experience by showing responses as they
-arrive.
+## Rust Style and Idioms
 
-All code you write must have test with a high coverage.
+Write idiomatic, Rustacean code. Prioritize clarity, modularity, and
+zero-cost abstractions.
+
+### Traits and generics
+
+- Always use traits to define behaviour boundaries — this allows alternative
+  implementations (e.g. swapping MCP transports, storage backends, provider
+  SDKs) and makes testing with mocks straightforward.
+- Prefer generic parameters (`fn foo<T: MyTrait>(t: T)`) for hot paths where
+  monomorphization matters. Use `dyn Trait` (behind `Arc` / `Box`) when you
+  need heterogeneous collections or the concrete type isn't known until
+  runtime.
+- Derive `Default` on structs whenever all fields have sensible defaults — it
+  pairs well with struct update syntax and `unwrap_or_default()`.
+
+### Typed data over loose JSON
+
+Use concrete Rust types (`struct`, `enum`) instead of `serde_json::Value`
+wherever the shape is known. This gives compile-time guarantees, better
+documentation, and avoids stringly-typed field access. Reserve
+`serde_json::Value` for truly dynamic / schema-less data.
+
+### Concurrency
+
+- Always prefer streaming over non-streaming API calls when possible.
+  Streaming provides a better, friendlier user experience by showing
+  responses as they arrive.
+- Run independent async work concurrently with `tokio::join!`,
+  `futures::join_all`, or `FuturesUnordered` instead of sequential `.await`
+  loops. Sequential awaits are fine when each step depends on the previous
+  result.
+- Never use `block_on` or any blocking call inside an async context (see
+  "Async all the way down" below).
+
+### Error handling
+
+- Use `anyhow::Result` for application-level errors and `thiserror` for
+  library-level errors that callers need to match on.
+- Propagate errors with `?`; avoid `.unwrap()` outside of tests.
+
+### General style
+
+- Prefer iterators and combinators (`.map()`, `.filter()`, `.collect()`)
+  over manual loops when they express intent more clearly.
+- Use `Cow<'_, str>` when a function may or may not need to allocate.
+- Keep public API surfaces small: expose only what downstream crates need
+  via `pub use` re-exports in `lib.rs`.
+- Prefer `#[must_use]` on functions whose return value should not be
+  silently ignored.
 
 ## Build and Development Commands
 
@@ -51,6 +97,45 @@ toggle their visibility. This keeps markup in HTML where it belongs and makes
 the structure easier to inspect. Preact components (HTM templates) are the
 exception — they use `html` tagged templates by design.
 
+### Styling and UI Consistency
+
+**Always use Tailwind utility classes instead of inline `style="..."` attributes.**
+This applies to all properties — spacing (`p-4`, `gap-3`), colors
+(`text-[var(--muted)]`, `bg-[var(--surface)]`), typography (`font-mono`,
+`text-xs`, `font-medium`), layout (`flex`, `grid`, `items-center`), borders
+(`border`, `rounded-md`), and anything else Tailwind covers. Only fall back to
+inline styles for truly one-off values that have no Tailwind equivalent (e.g. a
+specific `max-width` or `grid-template-columns` pattern).
+
+Keep buttons, links, and other interactive elements visually consistent with
+the existing UI. Reuse the shared CSS classes defined in `components.css`:
+
+- **Primary action**: `provider-btn` (green background, white text).
+- **Secondary action**: `provider-btn provider-btn-secondary` (surface
+  background, border).
+- **Destructive action**: `provider-btn provider-btn-danger` (red background,
+  white text). Never combine `provider-btn` with inline color overrides for
+  destructive buttons.
+
+When buttons or selects sit next to each other (e.g. in a header row), they
+must share the same height and text size so they look like a cohesive group.
+Use `provider-btn` variants for all of them rather than mixing ad-hoc Tailwind
+button styles with different padding/font sizes.
+
+Before creating a new CSS class, check whether an existing one already covers
+the use case. Duplicating styles (e.g. a second green-button class) leads to
+drift — consolidate instead.
+
+**Building Tailwind**: After adding or changing Tailwind utility classes in JS
+or HTML files, you must rebuild the CSS:
+
+```bash
+cd crates/gateway/ui
+npm install              # first time only
+npx tailwindcss -i input.css -o ../src/assets/style.css --minify
+```
+
+Use `npm run watch` during development for automatic rebuilds on file changes.
 ### Server-Injected Data (gon pattern)
 
 When the frontend needs server-side data **at page load** (before any async
@@ -95,6 +180,40 @@ All of those are fragile. The gon blob is the single injection point.
 When data changes at runtime, call `gon.refresh()` instead of manually
 updating individual fields — it keeps everything consistent.
 
+### Event Bus (WebSocket events in JS)
+
+Server-side broadcasts reach the UI via WebSocket frames. The JS event bus
+lives in `events.js`:
+
+```js
+import { onEvent } from "./events.js";
+
+// Subscribe to a named event. Returns an unsubscribe function.
+var off = onEvent("mcp.status", (payload) => {
+  // payload is the deserialized JSON from the broadcast
+});
+
+// In a Preact useEffect, return the unsubscribe for cleanup:
+useEffect(() => {
+  var off = onEvent("some.event", handler);
+  return off;
+}, []);
+```
+
+The WebSocket reader in `websocket.js` dispatches incoming event frames to
+all registered listeners via `eventListeners[frame.event]`. Do **not** use
+`window.addEventListener` / `CustomEvent` for server events — use this bus.
+
+## API Namespace Convention
+
+Each navigation tab in the UI should have its own API namespace, both for
+REST endpoints (`/api/<feature>/...`) and RPC methods (`<feature>.*`). This
+keeps concerns separated and makes it straightforward to gate each feature
+behind a cargo feature flag (e.g. `#[cfg(feature = "skills")]`).
+
+Examples: `/api/skills`, `/api/plugins`, `/api/channels`, with RPC methods
+`skills.list`, `plugins.install`, `channels.status`, etc. Never merge
+multiple features into a single endpoint.
 ## Authentication Architecture
 
 The gateway supports password and passkey (WebAuthn) authentication, managed
@@ -249,6 +368,30 @@ Rules:
 - **RwLock guards**: when a `RwLock<Option<Secret<String>>>` read guard is
   followed by a write in the same function, scope the read guard in a block
   `{ let guard = lock.read().await; ... }` to avoid deadlocks.
+
+## Data and Config Directories
+
+Moltis uses two directories, **never** the current working directory:
+
+- **Config dir** (`moltis_config::config_dir()`) — `~/.moltis/` by default.
+  Contains `moltis.toml`, `credentials.json`, `mcp-servers.json`.
+  Overridable via `--config-dir` or `MOLTIS_CONFIG_DIR`.
+- **Data dir** (`moltis_config::data_dir()`) — `~/.moltis/` by default.
+  Contains `moltis.db`, `memory.db`, `sessions/`, `logs.jsonl`,
+  `MEMORY.md`, `memory/*.md`.
+  Overridable via `--data-dir` or `MOLTIS_DATA_DIR`.
+
+**Rules:**
+- **Never use `std::env::current_dir()`** to resolve paths for persistent
+  storage (databases, memory files, config). Always use `data_dir()` or
+  `config_dir()`. Writing to cwd leaks files into the user's repo.
+- When a function needs a storage path, pass `data_dir` explicitly or call
+  `moltis_config::data_dir()`. Don't assume the process was started from a
+  specific directory.
+- The gateway's `run()` function resolves `data_dir` once at startup
+  (`server.rs`) and threads it through. Prefer using that resolved value
+  over calling `data_dir()` repeatedly.
+
 ## Provider Implementation Guidelines
 
 ### Async all the way down

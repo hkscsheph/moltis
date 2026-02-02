@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc};
 
 use {
     anyhow::{Result, bail},
@@ -14,6 +14,36 @@ use crate::{
 
 /// Maximum number of tool-call loop iterations before giving up.
 const MAX_ITERATIONS: usize = 25;
+
+/// Error patterns that indicate the context window has been exceeded.
+const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
+    "context_length_exceeded",
+    "max_tokens",
+    "too many tokens",
+    "request too large",
+    "maximum context length",
+    "context window",
+    "token limit",
+    "content_too_large",
+    "request_too_large",
+];
+
+/// Check if an error message indicates a context window overflow.
+fn is_context_window_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    CONTEXT_WINDOW_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Typed errors from the agent loop.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunError {
+    /// The provider reported that the context window / token limit was exceeded.
+    #[error("context window exceeded: {0}")]
+    ContextWindowExceeded(String),
+    /// Any other error.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// Result of running the agent loop.
 #[derive(Debug)]
@@ -50,6 +80,18 @@ pub enum RunnerEvent {
     ThinkingText(String),
     TextDelta(String),
     Iteration(usize),
+    SubAgentStart {
+        task: String,
+        model: String,
+        depth: u64,
+    },
+    SubAgentEnd {
+        task: String,
+        model: String,
+        depth: u64,
+        iterations: usize,
+        tool_calls_made: usize,
+    },
 }
 
 /// Try to parse a tool call from the LLM's text response.
@@ -106,6 +148,103 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
     ))
 }
 
+// ── Tool result sanitization ────────────────────────────────────────────
+
+/// Tag that starts a base64 data URI.
+const BASE64_TAG: &str = "data:";
+/// Marker between MIME type and base64 payload.
+const BASE64_MARKER: &str = ";base64,";
+/// Minimum length of a blob payload (base64 or hex) to be worth stripping.
+const BLOB_MIN_LEN: usize = 200;
+
+fn is_base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+}
+
+/// Strip base64 data-URI blobs (e.g. `data:image/png;base64,AAAA...`) and
+/// replace them with a short placeholder. Only targets payloads ≥ 200 chars.
+fn strip_base64_blobs(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find(BASE64_TAG) {
+        result.push_str(&rest[..start]);
+        let after_tag = &rest[start + BASE64_TAG.len()..];
+
+        if let Some(marker_pos) = after_tag.find(BASE64_MARKER) {
+            let payload_start = marker_pos + BASE64_MARKER.len();
+            let payload = &after_tag[payload_start..];
+            let payload_len = payload.bytes().take_while(|b| is_base64_byte(*b)).count();
+
+            if payload_len >= BLOB_MIN_LEN {
+                let total_uri_len = BASE64_TAG.len() + payload_start + payload_len;
+                write!(result, "[base64 data removed — {total_uri_len} bytes]").unwrap();
+                rest = &rest[start + total_uri_len..];
+                continue;
+            }
+        }
+
+        result.push_str(BASE64_TAG);
+        rest = after_tag;
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Strip long hex sequences (≥ 200 hex chars) that look like binary dumps.
+fn strip_hex_blobs(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_ascii_hexdigit() {
+            let mut end = start;
+            while let Some(&(i, c)) = chars.peek() {
+                if c.is_ascii_hexdigit() {
+                    end = i + c.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let run = end - start;
+            if run >= BLOB_MIN_LEN {
+                write!(result, "[hex data removed — {run} chars]").unwrap();
+            } else {
+                result.push_str(&input[start..end]);
+            }
+        } else {
+            result.push(ch);
+            chars.next();
+        }
+    }
+    result
+}
+
+/// Sanitize a tool result string before feeding it to the LLM.
+///
+/// 1. Strips base64 data URIs (≥ 200 char payloads).
+/// 2. Strips long hex sequences (≥ 200 hex chars).
+/// 3. Truncates the result to `max_bytes` (at a char boundary), appending a
+///    truncation marker.
+pub fn sanitize_tool_result(input: &str, max_bytes: usize) -> String {
+    let mut result = strip_base64_blobs(input);
+    result = strip_hex_blobs(&result);
+
+    if result.len() <= max_bytes {
+        return result;
+    }
+
+    let original_len = result.len();
+    let mut end = max_bytes;
+    while end > 0 && !result.is_char_boundary(end) {
+        end -= 1;
+    }
+    result.truncate(end);
+    write!(result, "\n\n[truncated — {original_len} bytes total]").unwrap();
+    result
+}
+
 /// Run the agent loop: send messages to the LLM, execute tool calls, repeat.
 ///
 /// If `history` is provided, those messages are inserted between the system
@@ -117,7 +256,7 @@ pub async fn run_agent_loop(
     user_message: &str,
     on_event: Option<&OnEvent>,
     history: Option<Vec<serde_json::Value>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     run_agent_loop_with_context(
         provider,
         tools,
@@ -142,8 +281,11 @@ pub async fn run_agent_loop_with_context(
     history: Option<Vec<serde_json::Value>>,
     tool_context: Option<serde_json::Value>,
     hook_registry: Option<Arc<HookRegistry>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
+    let max_tool_result_bytes = moltis_config::discover_and_load()
+        .tools
+        .max_tool_result_bytes;
     let tool_schemas = tools.list_schemas();
 
     info!(
@@ -185,7 +327,9 @@ pub async fn run_agent_loop_with_context(
         iterations += 1;
         if iterations > MAX_ITERATIONS {
             warn!("agent loop exceeded max iterations ({})", MAX_ITERATIONS);
-            bail!("agent loop exceeded max iterations");
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent loop exceeded max iterations"
+            )));
         }
 
         if let Some(cb) = on_event {
@@ -203,8 +347,16 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse =
-            provider.complete(&messages, schemas_for_api).await?;
+        let mut response: CompletionResponse = provider
+            .complete(&messages, schemas_for_api)
+            .await
+            .map_err(|e| {
+                if is_context_window_error(&e.to_string()) {
+                    AgentRunError::ContextWindowExceeded(e.to_string())
+                } else {
+                    AgentRunError::Other(e)
+                }
+            })?;
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -304,10 +456,11 @@ pub async fn run_agent_loop_with_context(
             .unwrap_or("")
             .to_string();
 
-        // Execute each tool call.
-        for tc in &response.tool_calls {
-            total_tool_calls += 1;
+        // Execute tool calls concurrently.
+        total_tool_calls += response.tool_calls.len();
 
+        // Emit all ToolCallStart events first (preserves notification order).
+        for tc in &response.tool_calls {
             if let Some(cb) = on_event {
                 cb(RunnerEvent::ToolCallStart {
                     id: tc.id.clone(),
@@ -315,50 +468,23 @@ pub async fn run_agent_loop_with_context(
                     arguments: tc.arguments.clone(),
                 });
             }
+            info!(tool = %tc.name, id = %tc.id, args = %tc.arguments, "executing tool");
+        }
 
-            // Dispatch BeforeToolCall hook — may block or modify arguments.
-            let mut effective_args = tc.arguments.clone();
-            if let Some(ref hooks) = hook_registry {
-                let payload = HookPayload::BeforeToolCall {
-                    session_key: session_key.clone(),
-                    tool_name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                };
-                match hooks.dispatch(&payload).await {
-                    Ok(HookAction::Block(reason)) => {
-                        warn!(tool = %tc.name, reason = %reason, "tool call blocked by hook");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: false,
-                                error: Some(reason.clone()),
-                                result: None,
-                            });
-                        }
-                        let err_str = format!("blocked by hook: {reason}");
-                        messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": serde_json::json!({ "error": err_str }).to_string(),
-                        }));
-                        continue;
-                    },
-                    Ok(HookAction::ModifyPayload(v)) => {
-                        effective_args = v;
-                    },
-                    Ok(HookAction::Continue) => {},
-                    Err(e) => {
-                        warn!(tool = %tc.name, error = %e, "BeforeToolCall hook dispatch failed");
-                    },
-                }
-            }
+        // Build futures for all tool calls (executed concurrently).
+        let tool_futures: Vec<_> = response
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let tool = tools.get(&tc.name);
+                let mut args = tc.arguments.clone();
 
-            info!(tool = %tc.name, id = %tc.id, args = %effective_args, "executing tool");
+                // Dispatch BeforeToolCall hook — may block or modify arguments.
+                let hook_registry = hook_registry.clone();
+                let session_key = session_key.clone();
+                let tc_name = tc.name.clone();
+                let _tc_id = tc.id.clone();
 
-            let result = if let Some(tool) = tools.get(&tc.name) {
-                // Merge tool_context (e.g. _session_key) into the tool call params.
-                let mut args = effective_args;
                 if let Some(ref ctx) = tool_context
                     && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
                 {
@@ -366,76 +492,111 @@ pub async fn run_agent_loop_with_context(
                         args_obj.insert(k.clone(), v.clone());
                     }
                 }
-                match tool.execute(args).await {
-                    Ok(val) => {
-                        info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
-                        trace!(tool = %tc.name, result = %val, "tool result");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: true,
-                                error: None,
-                                result: Some(val.clone()),
-                            });
+                async move {
+                    // Run BeforeToolCall hook.
+                    if let Some(ref hooks) = hook_registry {
+                        let payload = HookPayload::BeforeToolCall {
+                            session_key: session_key.clone(),
+                            tool_name: tc_name.clone(),
+                            arguments: args.clone(),
+                        };
+                        match hooks.dispatch(&payload).await {
+                            Ok(HookAction::Block(reason)) => {
+                                warn!(tool = %tc_name, reason = %reason, "tool call blocked by hook");
+                                let err_str = format!("blocked by hook: {reason}");
+                                return (
+                                    false,
+                                    serde_json::json!({ "error": err_str }),
+                                    Some(err_str),
+                                );
+                            },
+                            Ok(HookAction::ModifyPayload(v)) => {
+                                args = v;
+                            },
+                            Ok(HookAction::Continue) => {},
+                            Err(e) => {
+                                warn!(tool = %tc_name, error = %e, "BeforeToolCall hook dispatch failed");
+                            },
                         }
-                        // Dispatch AfterToolCall hook.
-                        if let Some(ref hooks) = hook_registry {
-                            let payload = HookPayload::AfterToolCall {
-                                session_key: session_key.clone(),
-                                tool_name: tc.name.clone(),
-                                success: true,
-                                result: Some(val.clone()),
-                            };
-                            if let Err(e) = hooks.dispatch(&payload).await {
-                                warn!(tool = %tc.name, error = %e, "AfterToolCall hook dispatch failed");
-                            }
-                        }
-                        serde_json::json!({ "result": val })
-                    },
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        warn!(tool = %tc.name, id = %tc.id, error = %err_str, "tool execution failed");
-                        if let Some(cb) = on_event {
-                            cb(RunnerEvent::ToolCallEnd {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                success: false,
-                                error: Some(err_str.clone()),
-                                result: None,
-                            });
-                        }
-                        // Dispatch AfterToolCall hook on failure too.
-                        if let Some(ref hooks) = hook_registry {
-                            let payload = HookPayload::AfterToolCall {
-                                session_key: session_key.clone(),
-                                tool_name: tc.name.clone(),
-                                success: false,
-                                result: None,
-                            };
-                            if let Err(e) = hooks.dispatch(&payload).await {
-                                warn!(tool = %tc.name, error = %e, "AfterToolCall hook dispatch failed");
-                            }
-                        }
-                        serde_json::json!({ "error": err_str })
-                    },
-                }
-            } else {
-                let err_str = format!("unknown tool: {}", tc.name);
-                warn!(tool = %tc.name, id = %tc.id, "unknown tool requested by LLM");
-                if let Some(cb) = on_event {
-                    cb(RunnerEvent::ToolCallEnd {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        success: false,
-                        error: Some(err_str.clone()),
-                        result: None,
-                    });
-                }
-                serde_json::json!({ "error": err_str })
-            };
+                    }
 
-            let tool_result_str = result.to_string();
+                    if let Some(tool) = tool {
+                        match tool.execute(args).await {
+                            Ok(val) => {
+                                // Dispatch AfterToolCall hook on success.
+                                if let Some(ref hooks) = hook_registry {
+                                    let payload = HookPayload::AfterToolCall {
+                                        session_key: session_key.clone(),
+                                        tool_name: tc_name.clone(),
+                                        success: true,
+                                        result: Some(val.clone()),
+                                    };
+                                    if let Err(e) = hooks.dispatch(&payload).await {
+                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                    }
+                                }
+                                (true, serde_json::json!({ "result": val }), None)
+                            },
+                            Err(e) => {
+                                let err_str = e.to_string();
+                                // Dispatch AfterToolCall hook on failure.
+                                if let Some(ref hooks) = hook_registry {
+                                    let payload = HookPayload::AfterToolCall {
+                                        session_key: session_key.clone(),
+                                        tool_name: tc_name.clone(),
+                                        success: false,
+                                        result: None,
+                                    };
+                                    if let Err(e) = hooks.dispatch(&payload).await {
+                                        warn!(tool = %tc_name, error = %e, "AfterToolCall hook dispatch failed");
+                                    }
+                                }
+                                (
+                                    false,
+                                    serde_json::json!({ "error": err_str }),
+                                    Some(err_str),
+                                )
+                            },
+                        }
+                    } else {
+                        let err_str = format!("unknown tool: {tc_name}");
+                        (
+                            false,
+                            serde_json::json!({ "error": err_str }),
+                            Some(err_str),
+                        )
+                    }
+                }
+            })
+            .collect();
+
+        // Execute all tools concurrently and collect results in order.
+        let results = futures::future::join_all(tool_futures).await;
+
+        // Process results in original order: emit events, append messages.
+        for (tc, (success, result, error)) in response.tool_calls.iter().zip(results) {
+            if success {
+                info!(tool = %tc.name, id = %tc.id, "tool execution succeeded");
+                trace!(tool = %tc.name, result = %result, "tool result");
+            } else {
+                warn!(tool = %tc.name, id = %tc.id, error = %error.as_deref().unwrap_or(""), "tool execution failed");
+            }
+
+            if let Some(cb) = on_event {
+                cb(RunnerEvent::ToolCallEnd {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    success,
+                    error,
+                    result: if success {
+                        result.get("result").cloned()
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
             debug!(
                 tool = %tc.name,
                 id = %tc.id,
@@ -923,5 +1084,379 @@ mod tests {
             evts.iter()
                 .any(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. }))
         );
+    }
+
+    // ── Parallel tool execution tests ────────────────────────────────
+
+    /// A tool that sleeps then returns its name.
+    struct SlowTool {
+        tool_name: String,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl crate::tool_registry::AgentTool for SlowTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "Slow tool for testing"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(serde_json::json!({ "tool": self.tool_name }))
+        }
+    }
+
+    /// A tool that always fails.
+    struct FailTool;
+
+    #[async_trait]
+    impl crate::tool_registry::AgentTool for FailTool {
+        fn name(&self) -> &str {
+            "fail_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Always fails"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+            anyhow::bail!("intentional failure")
+        }
+    }
+
+    /// Mock provider returning N tool calls on the first call, then text.
+    struct MultiToolProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+        tool_calls: Vec<ToolCall>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for MultiToolProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "mock-model"
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: &[serde_json::Value],
+        ) -> Result<CompletionResponse> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                Ok(CompletionResponse {
+                    text: None,
+                    tool_calls: self.tool_calls.clone(),
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                    },
+                })
+            } else {
+                Ok(CompletionResponse {
+                    text: Some("All done".into()),
+                    tool_calls: vec![],
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 10,
+                    },
+                })
+            }
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<serde_json::Value>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_execution() {
+        let provider = Arc::new(MultiToolProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "tool_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "tool_b".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "tool_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_a".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_b".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_c".into(),
+            delay_ms: 0,
+        }));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "Test bot",
+            "Use all tools",
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
+
+        // Verify all 3 ToolCallStart events come before any ToolCallEnd events.
+        let evts = events.lock().unwrap();
+        let starts: Vec<_> = evts
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, RunnerEvent::ToolCallStart { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let ends: Vec<_> = evts
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, RunnerEvent::ToolCallEnd { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(ends.len(), 3);
+        assert!(
+            starts.iter().all(|s| ends.iter().all(|e| s < e)),
+            "all starts should precede all ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_one_fails() {
+        let provider = Arc::new(MultiToolProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "tool_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "fail_tool".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "tool_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_a".into(),
+            delay_ms: 0,
+        }));
+        tools.register(Box::new(FailTool));
+        tools.register(Box::new(SlowTool {
+            tool_name: "tool_c".into(),
+            delay_ms: 0,
+        }));
+
+        let events: Arc<std::sync::Mutex<Vec<RunnerEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let on_event: OnEvent = Box::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let result = run_agent_loop(
+            provider,
+            &tools,
+            "Test bot",
+            "Use all tools",
+            Some(&on_event),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
+
+        // Verify: 2 successes, 1 failure.
+        let evts = events.lock().unwrap();
+        let successes = evts
+            .iter()
+            .filter(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. }))
+            .count();
+        let failures = evts
+            .iter()
+            .filter(|e| matches!(e, RunnerEvent::ToolCallEnd { success: false, .. }))
+            .count();
+        assert_eq!(successes, 2);
+        assert_eq!(failures, 1);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_execution_is_concurrent() {
+        let provider = Arc::new(MultiToolProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".into(),
+                    name: "slow_a".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c2".into(),
+                    name: "slow_b".into(),
+                    arguments: serde_json::json!({}),
+                },
+                ToolCall {
+                    id: "c3".into(),
+                    name: "slow_c".into(),
+                    arguments: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_a".into(),
+            delay_ms: 100,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_b".into(),
+            delay_ms: 100,
+        }));
+        tools.register(Box::new(SlowTool {
+            tool_name: "slow_c".into(),
+            delay_ms: 100,
+        }));
+
+        let start = std::time::Instant::now();
+        let result = run_agent_loop(provider, &tools, "Test bot", "Use all tools", None, None)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.text, "All done");
+        assert_eq!(result.tool_calls_made, 3);
+        // If sequential, would take ≥300ms. Parallel should be ~100ms.
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "parallel execution took {:?}, expected < 250ms",
+            elapsed
+        );
+    }
+
+    // ── sanitize_tool_result tests ──────────────────────────────────
+
+    #[test]
+    fn test_sanitize_short_input_unchanged() {
+        let input = "hello world";
+        assert_eq!(sanitize_tool_result(input, 50_000), "hello world");
+    }
+
+    #[test]
+    fn test_sanitize_truncates_long_input() {
+        let input = "x".repeat(1000);
+        let result = sanitize_tool_result(&input, 100);
+        assert!(result.starts_with("xxxx"));
+        assert!(result.contains("[truncated"));
+        assert!(result.contains("1000 bytes total"));
+    }
+
+    #[test]
+    fn test_sanitize_truncate_respects_char_boundary() {
+        let input = "é".repeat(100); // 200 bytes
+        let result = sanitize_tool_result(&input, 51); // mid-char
+        assert!(result.contains("[truncated"));
+        let prefix_end = result.find("\n\n[truncated").unwrap();
+        assert!(prefix_end <= 51);
+        assert_eq!(prefix_end % 2, 0);
+    }
+
+    #[test]
+    fn test_sanitize_strips_base64_data_uri() {
+        let payload = "A".repeat(300);
+        let input = format!("before data:image/png;base64,{payload} after");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(!result.contains(&payload));
+        assert!(result.contains("[base64 data removed"));
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_short_base64() {
+        let payload = "QUFB";
+        let input = format!("data:text/plain;base64,{payload}");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(result.contains(payload));
+    }
+
+    #[test]
+    fn test_sanitize_strips_long_hex() {
+        let hex = "a1b2c3d4".repeat(50); // 400 hex chars
+        let input = format!("prefix {hex} suffix");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(!result.contains(&hex));
+        assert!(result.contains("[hex data removed"));
+        assert!(result.contains("prefix"));
+        assert!(result.contains("suffix"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_short_hex() {
+        let hex = "deadbeef";
+        let input = format!("code: {hex}");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(result.contains(hex));
     }
 }

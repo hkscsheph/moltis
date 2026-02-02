@@ -6,6 +6,7 @@ import { render } from "preact";
 import { useEffect } from "preact/hooks";
 import { sendRpc } from "./helpers.js";
 import { fetchModels } from "./models.js";
+import { updateNavCount } from "./nav-counts.js";
 import { openProviderModal } from "./providers.js";
 import { registerPage } from "./router.js";
 import { connected } from "./signals.js";
@@ -23,6 +24,7 @@ function fetchProviders() {
 		providers.value = (res.payload || [])
 			.filter((p) => p.configured)
 			.sort((a, b) => a.displayName.localeCompare(b.displayName));
+		updateNavCount("providers", providers.value.length);
 	});
 }
 
@@ -48,14 +50,14 @@ function ProviderCard(props) {
         ${p.authType === "oauth" ? "OAuth" : "API Key"}
       </span>
     </div>
-    <button class="session-action-btn session-delete" title="Remove ${p.displayName}" onClick=${onRemove}>Remove</button>
+    <button class="provider-btn provider-btn-sm provider-btn-danger" title="Remove ${p.displayName}" onClick=${onRemove}>Remove</button>
   </div>`;
 }
 
 function ProvidersPage() {
 	useEffect(() => {
-		fetchProviders();
-	}, []);
+		if (connected.value) fetchProviders();
+	}, [connected.value]);
 
 	S.setRefreshProvidersPage(fetchProviders);
 
@@ -63,7 +65,7 @@ function ProvidersPage() {
     <div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">
       <div class="flex items-center gap-3">
         <h2 class="text-lg font-medium text-[var(--text-strong)]">Providers</h2>
-        <button class="bg-[var(--accent-dim)] text-white border-none px-3 py-1.5 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors"
+        <button class="provider-btn"
           onClick=${() => {
 						if (connected.value) openProviderModal();
 					}}>+ Add Provider</button>

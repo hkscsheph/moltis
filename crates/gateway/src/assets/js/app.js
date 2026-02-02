@@ -2,6 +2,7 @@
 
 import { onEvent } from "./events.js";
 import * as gon from "./gon.js";
+import { updateNavCounts } from "./nav-counts.js";
 import { renderSessionProjectSelect } from "./project-combo.js";
 import { renderProjectSelect } from "./projects.js";
 import { mount, navigate, registerPage } from "./router.js";
@@ -19,12 +20,14 @@ import "./page-channels.js";
 import "./page-logs.js";
 import "./page-plugins.js";
 import "./page-skills.js";
+import "./page-mcp.js";
 import "./page-settings.js";
 import "./page-images.js";
 import "./page-setup.js";
 import { setHasPasskeys } from "./page-login.js";
 
 // Import side-effect modules
+import "./nav-counts.js";
 import "./session-search.js";
 import "./time-format.js";
 
@@ -130,6 +133,7 @@ function fetchBootstrap() {
 				renderSessionProjectSelect();
 			}
 			S.setSandboxInfo(boot.sandbox || null);
+			if (boot.counts) updateNavCounts(boot.counts);
 		})
 		.catch(() => {
 			/* WS connect will fetch this data anyway */

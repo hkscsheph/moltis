@@ -147,13 +147,91 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "_session_key": &session_key,
             });
             // Forward the channel's default model to chat.send() if configured.
+            // If no channel model is set, check if the session already has a model.
+            // If neither exists, assign the first registered model so the session
+            // behaves the same as the web UI (which always sends an explicit model).
             if let Some(ref model) = meta.model {
                 params["model"] = serde_json::json!(model);
+
+                // Notify the user which model was assigned from the channel config
+                // on the first message of a new session (no model set yet).
+                let session_has_model = if let Some(ref sm) = state.services.session_metadata {
+                    sm.get(&session_key).await.and_then(|e| e.model).is_some()
+                } else {
+                    false
+                };
+                if !session_has_model {
+                    // Persist channel model on the session.
+                    let _ = state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "model": model,
+                        }))
+                        .await;
+
+                    // Look up displayName for the notification.
+                    let display: String = if let Ok(models_val) = state.services.model.list().await
+                        && let Some(models) = models_val.as_array()
+                    {
+                        models
+                            .iter()
+                            .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model))
+                            .and_then(|m| m.get("displayName").and_then(|v| v.as_str()))
+                            .unwrap_or(model)
+                            .to_string()
+                    } else {
+                        model.clone()
+                    };
+                    if let Some(outbound) = state.services.channel_outbound_arc() {
+                        let msg = format!("Using *{display}*. Use /model to change.");
+                        let _ = outbound
+                            .send_text(&reply_to.account_id, &reply_to.chat_id, &msg)
+                            .await;
+                    }
+                }
+            } else {
+                let session_has_model = if let Some(ref sm) = state.services.session_metadata {
+                    sm.get(&session_key).await.and_then(|e| e.model).is_some()
+                } else {
+                    false
+                };
+                if !session_has_model
+                    && let Ok(models_val) = state.services.model.list().await
+                    && let Some(models) = models_val.as_array()
+                    && let Some(first) = models.first()
+                    && let Some(id) = first.get("id").and_then(|v| v.as_str())
+                {
+                    params["model"] = serde_json::json!(id);
+                    // Also persist on the session so subsequent messages
+                    // (including from the web UI) use the same model.
+                    let _ = state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "model": id,
+                        }))
+                        .await;
+
+                    // Notify the user which model was auto-selected.
+                    let display = first
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    if let Some(outbound) = state.services.channel_outbound_arc() {
+                        let msg = format!("Using *{display}*. Use /model to change.");
+                        let _ = outbound
+                            .send_text(&reply_to.account_id, &reply_to.chat_id, &msg)
+                            .await;
+                    }
+                }
             }
 
             // Send a repeating "typing" indicator every 4s until chat.send()
             // completes. Telegram's typing status expires after ~5s.
-            if let Some(outbound) = state.services.channel_outbound_arc() {
+            let send_result = if let Some(outbound) = state.services.channel_outbound_arc() {
                 let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
                 let account_id = reply_to.account_id.clone();
                 let chat_id = reply_to.chat_id.clone();
@@ -168,12 +246,26 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         }
                     }
                 });
-                if let Err(e) = chat.send(params).await {
-                    error!("channel dispatch_to_chat failed: {e}");
-                }
+                let result = chat.send(params).await;
                 let _ = done_tx.send(());
-            } else if let Err(e) = chat.send(params).await {
+                result
+            } else {
+                chat.send(params).await
+            };
+
+            if let Err(e) = send_result {
                 error!("channel dispatch_to_chat failed: {e}");
+                // Send the error back to the originating channel so the user
+                // knows something went wrong.
+                if let Some(outbound) = state.services.channel_outbound_arc() {
+                    let error_msg = format!("⚠️ {e}");
+                    if let Err(send_err) = outbound
+                        .send_text(&reply_to.account_id, &reply_to.chat_id, &error_msg)
+                        .await
+                    {
+                        warn!("failed to send error back to channel: {send_err}");
+                    }
+                }
             }
         } else {
             warn!("channel dispatch_to_chat: gateway not ready");
@@ -255,6 +347,60 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     "channel /new: created new session"
                 );
 
+                // Assign a model to the new session: prefer the channel's
+                // configured model, fall back to the first registered model.
+                let channel_model: Option<String> =
+                    state.services.channel.status().await.ok().and_then(|v| {
+                        let channels = v.get("channels")?.as_array()?;
+                        channels
+                            .iter()
+                            .find(|ch| {
+                                ch.get("account_id").and_then(|v| v.as_str())
+                                    == Some(&reply_to.account_id)
+                            })
+                            .and_then(|ch| {
+                                ch.get("config")?.get("model")?.as_str().map(String::from)
+                            })
+                    });
+
+                let models_val = state.services.model.list().await.ok();
+                let models = models_val.as_ref().and_then(|v| v.as_array());
+
+                let (model_id, model_display): (Option<String>, String) = if let Some(ref cm) =
+                    channel_model
+                {
+                    let d = models
+                        .and_then(|ms| {
+                            ms.iter()
+                                .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(cm.as_str()))
+                                .and_then(|m| m.get("displayName").and_then(|v| v.as_str()))
+                        })
+                        .unwrap_or(cm.as_str());
+                    (Some(cm.clone()), d.to_string())
+                } else if let Some(ms) = models
+                    && let Some(first) = ms.first()
+                    && let Some(id) = first.get("id").and_then(|v| v.as_str())
+                {
+                    let d = first
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id);
+                    (Some(id.to_string()), d.to_string())
+                } else {
+                    (None, String::new())
+                };
+
+                if let Some(ref mid) = model_id {
+                    let _ = state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &new_key,
+                            "model": mid,
+                        }))
+                        .await;
+                }
+
                 // Notify web UI so the session list refreshes.
                 broadcast(
                     state,
@@ -270,7 +416,13 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 )
                 .await;
 
-                Ok("New session started.".to_string())
+                if model_display.is_empty() {
+                    Ok("New session started.".to_string())
+                } else {
+                    Ok(format!(
+                        "New session started. Using *{model_display}*. Use /model to change."
+                    ))
+                }
             },
             "clear" => {
                 let params = serde_json::json!({ "_session_key": &session_key });

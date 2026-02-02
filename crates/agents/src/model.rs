@@ -52,7 +52,7 @@ pub struct CompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

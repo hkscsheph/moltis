@@ -429,6 +429,11 @@ export function connect() {
 		}
 		S.setStreamEl(null);
 		S.setStreamText("");
+		// Reject all pending RPC callbacks so callers don't hang forever.
+		for (var id in S.pending) {
+			S.pending[id]({ ok: false, error: { message: "WebSocket disconnected" } });
+			delete S.pending[id];
+		}
 		scheduleReconnect();
 	};
 

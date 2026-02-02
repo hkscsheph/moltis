@@ -70,8 +70,10 @@ impl Default for ResolvedIdentity {
 #[serde(default)]
 pub struct MoltisConfig {
     pub providers: ProvidersConfig,
+    pub chat: ChatConfig,
     pub tools: ToolsConfig,
     pub skills: SkillsConfig,
+    pub mcp: McpConfig,
     pub channels: ChannelsConfig,
     pub tls: TlsConfig,
     pub auth: AuthConfig,
@@ -79,6 +81,26 @@ pub struct MoltisConfig {
     pub user: UserProfile,
     pub hooks: Option<HooksConfig>,
     pub memory: MemoryEmbeddingConfig,
+    pub tailscale: TailscaleConfig,
+}
+
+/// Tailscale Serve/Funnel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TailscaleConfig {
+    /// Tailscale mode: "off", "serve", or "funnel".
+    pub mode: String,
+    /// Reset tailscale serve/funnel when the gateway shuts down.
+    pub reset_on_exit: bool,
+}
+
+impl Default for TailscaleConfig {
+    fn default() -> Self {
+        Self {
+            mode: "off".into(),
+            reset_on_exit: true,
+        }
+    }
 }
 
 /// Memory embedding provider configuration.
@@ -161,6 +183,38 @@ fn default_true() -> bool {
     true
 }
 
+/// MCP (Model Context Protocol) server configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Configured MCP servers, keyed by server name.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerEntry>,
+}
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerEntry {
+    /// Command to spawn the server process (stdio transport).
+    #[serde(default)]
+    pub command: String,
+    /// Arguments to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Whether this server is enabled. Defaults to true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Transport type: "stdio" (default) or "sse".
+    #[serde(default)]
+    pub transport: String,
+    /// URL for SSE transport. Required when `transport` is "sse".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// Channel configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -201,13 +255,58 @@ impl Default for TlsConfig {
     }
 }
 
-/// Tools configuration (exec, sandbox, policy, web).
+/// Chat configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// How to handle messages that arrive while an agent run is active.
+    pub message_queue_mode: MessageQueueMode,
+}
+
+/// Behaviour when `chat.send()` is called during an active run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageQueueMode {
+    /// Queue each message; replay them one-by-one after the current run.
+    #[default]
+    Followup,
+    /// Buffer messages; concatenate and process as a single message after the current run.
+    Collect,
+}
+
+/// Tools configuration (exec, sandbox, policy, web).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub exec: ExecConfig,
     pub policy: ToolPolicyConfig,
     pub web: WebConfig,
+    /// Maximum wall-clock seconds for an agent run (0 = no timeout). Default 600.
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+    /// Maximum bytes for a single tool result before truncation. Default 50KB.
+    #[serde(default = "default_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            exec: ExecConfig::default(),
+            policy: ToolPolicyConfig::default(),
+            web: WebConfig::default(),
+            agent_timeout_secs: default_agent_timeout_secs(),
+            max_tool_result_bytes: default_max_tool_result_bytes(),
+        }
+    }
+}
+
+fn default_agent_timeout_secs() -> u64 {
+    600
+}
+
+fn default_max_tool_result_bytes() -> usize {
+    50_000
 }
 
 /// Web tools configuration (search, fetch).
