@@ -482,12 +482,7 @@ pub async fn start_gateway(
         }
     }
 
-    // Wire live session service with sandbox router and project store.
-    services.session = Arc::new(
-        LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
-            .with_sandbox_router(Arc::clone(&sandbox_router))
-            .with_project_store(Arc::clone(&project_store)),
-    );
+    // Session service is wired after hook registry is built (below).
 
     // Wire channel store and Telegram channel service.
     {
@@ -623,6 +618,18 @@ pub async fn start_gateway(
 
         Some(Arc::new(registry))
     };
+
+    // Wire live session service with sandbox router, project store, and hooks.
+    {
+        let mut session_svc =
+            LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
+                .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_project_store(Arc::clone(&project_store));
+        if let Some(ref hooks) = hook_registry {
+            session_svc = session_svc.with_hooks(Arc::clone(hooks));
+        }
+        services.session = Arc::new(session_svc);
+    }
 
     // ── Memory system initialization ─────────────────────────────────────
     let memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>> = {

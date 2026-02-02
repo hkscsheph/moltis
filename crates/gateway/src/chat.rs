@@ -281,6 +281,22 @@ impl ChatService for LiveChatService {
             }
         };
 
+        // Dispatch MessageReceived hook (read-only).
+        if let Some(ref hooks) = self.hook_registry {
+            let channel = params
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let payload = moltis_common::hooks::HookPayload::MessageReceived {
+                session_key: session_key.clone(),
+                content: text.clone(),
+                channel,
+            };
+            if let Err(e) = hooks.dispatch(&payload).await {
+                warn!(session = %session_key, error = %e, "MessageReceived hook failed");
+            }
+        }
+
         // Persist the user message (with optional channel metadata for UI display).
         let channel_meta = params.get("channel").cloned();
         let mut user_msg =

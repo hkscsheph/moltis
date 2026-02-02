@@ -154,6 +154,32 @@ pub async fn run_agent_loop_with_context(
         "starting agent loop"
     );
 
+    // Extract session key early for hook payloads.
+    let session_key_for_hooks = tool_context
+        .as_ref()
+        .and_then(|ctx| ctx.get("_session_key"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Dispatch BeforeAgentStart hook — may block or modify model.
+    if let Some(ref hooks) = hook_registry {
+        let payload = HookPayload::BeforeAgentStart {
+            session_key: session_key_for_hooks.clone(),
+            model: provider.id().to_string(),
+        };
+        match hooks.dispatch(&payload).await {
+            Ok(HookAction::Block(reason)) => {
+                warn!(reason = %reason, "agent start blocked by hook");
+                bail!("agent start blocked by hook: {reason}");
+            },
+            Ok(_) => {},
+            Err(e) => {
+                warn!(error = %e, "BeforeAgentStart hook dispatch failed");
+            },
+        }
+    }
+
     let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
         "content": system_prompt,
@@ -203,11 +229,48 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
+        // Dispatch MessageSending hook — can modify the user content being sent.
+        if let Some(ref hooks) = hook_registry {
+            let last_user_content = messages
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let payload = HookPayload::MessageSending {
+                session_key: session_key_for_hooks.clone(),
+                content: last_user_content,
+            };
+            match hooks.dispatch(&payload).await {
+                Ok(HookAction::Block(reason)) => {
+                    warn!(reason = %reason, "message sending blocked by hook");
+                    bail!("message sending blocked by hook: {reason}");
+                },
+                Ok(_) => {},
+                Err(e) => {
+                    warn!(error = %e, "MessageSending hook dispatch failed");
+                },
+            }
+        }
+
         let mut response: CompletionResponse =
             provider.complete(&messages, schemas_for_api).await?;
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
+        }
+
+        // Dispatch MessageSent hook (read-only) with the LLM response.
+        if let Some(ref hooks) = hook_registry {
+            let content = response.text.clone().unwrap_or_default();
+            let payload = HookPayload::MessageSent {
+                session_key: session_key_for_hooks.clone(),
+                content,
+            };
+            if let Err(e) = hooks.dispatch(&payload).await {
+                warn!(error = %e, "MessageSent hook dispatch failed");
+            }
         }
 
         total_input_tokens = total_input_tokens.saturating_add(response.usage.input_tokens);
@@ -257,6 +320,20 @@ pub async fn run_agent_loop_with_context(
                 tool_calls = total_tool_calls,
                 "agent loop complete — returning text"
             );
+
+            // Dispatch AgentEnd hook (read-only).
+            if let Some(ref hooks) = hook_registry {
+                let payload = HookPayload::AgentEnd {
+                    session_key: session_key_for_hooks.clone(),
+                    text: text.clone(),
+                    iterations,
+                    tool_calls: total_tool_calls,
+                };
+                if let Err(e) = hooks.dispatch(&payload).await {
+                    warn!(error = %e, "AgentEnd hook dispatch failed");
+                }
+            }
+
             return Ok(AgentRunResult {
                 text,
                 iterations,
@@ -296,14 +373,6 @@ pub async fn run_agent_loop_with_context(
         }
         messages.push(assistant_msg);
 
-        // Extract session key from tool_context for hook payloads.
-        let session_key = tool_context
-            .as_ref()
-            .and_then(|ctx| ctx.get("_session_key"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
         // Execute each tool call.
         for tc in &response.tool_calls {
             total_tool_calls += 1;
@@ -320,7 +389,7 @@ pub async fn run_agent_loop_with_context(
             let mut effective_args = tc.arguments.clone();
             if let Some(ref hooks) = hook_registry {
                 let payload = HookPayload::BeforeToolCall {
-                    session_key: session_key.clone(),
+                    session_key: session_key_for_hooks.clone(),
                     tool_name: tc.name.clone(),
                     arguments: tc.arguments.clone(),
                 };
@@ -382,7 +451,7 @@ pub async fn run_agent_loop_with_context(
                         // Dispatch AfterToolCall hook.
                         if let Some(ref hooks) = hook_registry {
                             let payload = HookPayload::AfterToolCall {
-                                session_key: session_key.clone(),
+                                session_key: session_key_for_hooks.clone(),
                                 tool_name: tc.name.clone(),
                                 success: true,
                                 result: Some(val.clone()),
@@ -408,7 +477,7 @@ pub async fn run_agent_loop_with_context(
                         // Dispatch AfterToolCall hook on failure too.
                         if let Some(ref hooks) = hook_registry {
                             let payload = HookPayload::AfterToolCall {
-                                session_key: session_key.clone(),
+                                session_key: session_key_for_hooks.clone(),
                                 tool_name: tc.name.clone(),
                                 success: false,
                                 result: None,
@@ -433,6 +502,29 @@ pub async fn run_agent_loop_with_context(
                     });
                 }
                 serde_json::json!({ "error": err_str })
+            };
+
+            // Dispatch ToolResultPersist hook — can modify the result before it enters history.
+            let result = if let Some(ref hooks) = hook_registry {
+                let payload = HookPayload::ToolResultPersist {
+                    session_key: session_key_for_hooks.clone(),
+                    tool_name: tc.name.clone(),
+                    result: result.clone(),
+                };
+                match hooks.dispatch_sync(&payload) {
+                    Ok(HookAction::ModifyPayload(v)) => v,
+                    Ok(HookAction::Block(reason)) => {
+                        warn!(tool = %tc.name, reason = %reason, "tool result persist blocked by hook");
+                        serde_json::json!({ "error": format!("result blocked: {reason}") })
+                    },
+                    Ok(HookAction::Continue) => result,
+                    Err(e) => {
+                        warn!(tool = %tc.name, error = %e, "ToolResultPersist hook failed");
+                        result
+                    },
+                }
+            } else {
+                result
             };
 
             let tool_result_str = result.to_string();
@@ -923,5 +1015,276 @@ mod tests {
             evts.iter()
                 .any(|e| matches!(e, RunnerEvent::ToolCallEnd { success: true, .. }))
         );
+    }
+
+    // ── Hook integration tests ──────────────────────────────────────
+
+    use moltis_common::hooks::{HookAction, HookHandler, HookPayload, HookRegistry};
+
+    /// Hook that blocks BeforeAgentStart.
+    struct BlockAgentStartHook;
+
+    #[async_trait]
+    impl HookHandler for BlockAgentStartHook {
+        fn name(&self) -> &str {
+            "block-agent-start"
+        }
+
+        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+            &[moltis_common::hooks::HookEvent::BeforeAgentStart]
+        }
+
+        async fn handle(
+            &self,
+            _event: moltis_common::hooks::HookEvent,
+            _payload: &HookPayload,
+        ) -> Result<HookAction> {
+            Ok(HookAction::Block("test block".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_before_agent_start_hook_blocks() {
+        let provider = Arc::new(MockProvider {
+            response_text: "Hello!".into(),
+        });
+        let tools = ToolRegistry::new();
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(BlockAgentStartHook));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "system",
+            "hi",
+            None,
+            None,
+            Some(serde_json::json!({"_session_key": "test"})),
+            Some(Arc::new(registry)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("agent start blocked by hook")
+        );
+    }
+
+    /// Hook that records AgentEnd events.
+    struct RecordAgentEndHook {
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl HookHandler for RecordAgentEndHook {
+        fn name(&self) -> &str {
+            "record-agent-end"
+        }
+
+        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+            &[moltis_common::hooks::HookEvent::AgentEnd]
+        }
+
+        async fn handle(
+            &self,
+            _event: moltis_common::hooks::HookEvent,
+            _payload: &HookPayload,
+        ) -> Result<HookAction> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(HookAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_end_hook_fires() {
+        let provider = Arc::new(MockProvider {
+            response_text: "Hello!".into(),
+        });
+        let tools = ToolRegistry::new();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(RecordAgentEndHook {
+            called: Arc::clone(&called),
+        }));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "system",
+            "hi",
+            None,
+            None,
+            Some(serde_json::json!({"_session_key": "test"})),
+            Some(Arc::new(registry)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Hello!");
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// Hook that blocks MessageSending.
+    struct BlockMessageSendingHook;
+
+    #[async_trait]
+    impl HookHandler for BlockMessageSendingHook {
+        fn name(&self) -> &str {
+            "block-message-sending"
+        }
+
+        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+            &[moltis_common::hooks::HookEvent::MessageSending]
+        }
+
+        async fn handle(
+            &self,
+            _event: moltis_common::hooks::HookEvent,
+            _payload: &HookPayload,
+        ) -> Result<HookAction> {
+            Ok(HookAction::Block("content policy violation".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_sending_hook_blocks() {
+        let provider = Arc::new(MockProvider {
+            response_text: "Hello!".into(),
+        });
+        let tools = ToolRegistry::new();
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(BlockMessageSendingHook));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "system",
+            "hi",
+            None,
+            None,
+            Some(serde_json::json!({"_session_key": "test"})),
+            Some(Arc::new(registry)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("message sending blocked")
+        );
+    }
+
+    /// Hook that records MessageSent events.
+    struct RecordMessageSentHook {
+        content: Arc<std::sync::Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl HookHandler for RecordMessageSentHook {
+        fn name(&self) -> &str {
+            "record-message-sent"
+        }
+
+        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+            &[moltis_common::hooks::HookEvent::MessageSent]
+        }
+
+        async fn handle(
+            &self,
+            _event: moltis_common::hooks::HookEvent,
+            payload: &HookPayload,
+        ) -> Result<HookAction> {
+            if let HookPayload::MessageSent { content, .. } = payload {
+                *self.content.lock().unwrap() = content.clone();
+            }
+            Ok(HookAction::Continue)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_sent_hook_fires() {
+        let provider = Arc::new(MockProvider {
+            response_text: "Hello from LLM!".into(),
+        });
+        let tools = ToolRegistry::new();
+        let content = Arc::new(std::sync::Mutex::new(String::new()));
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(RecordMessageSentHook {
+            content: Arc::clone(&content),
+        }));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "system",
+            "hi",
+            None,
+            None,
+            Some(serde_json::json!({"_session_key": "test"})),
+            Some(Arc::new(registry)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.text, "Hello from LLM!");
+        assert_eq!(*content.lock().unwrap(), "Hello from LLM!");
+    }
+
+    /// Hook that redacts tool results via ToolResultPersist.
+    struct RedactToolResultHook;
+
+    #[async_trait]
+    impl HookHandler for RedactToolResultHook {
+        fn name(&self) -> &str {
+            "redact-tool-result"
+        }
+
+        fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+            &[moltis_common::hooks::HookEvent::ToolResultPersist]
+        }
+
+        async fn handle(
+            &self,
+            _event: moltis_common::hooks::HookEvent,
+            _payload: &HookPayload,
+        ) -> Result<HookAction> {
+            Ok(HookAction::ModifyPayload(
+                serde_json::json!({"result": "[REDACTED]"}),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_tool_result_persist_hook_modifies() {
+        let provider = Arc::new(ToolCallingProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+
+        let mut registry = HookRegistry::new();
+        registry.register(Arc::new(RedactToolResultHook));
+
+        let result = run_agent_loop_with_context(
+            provider,
+            &tools,
+            "system",
+            "use tool",
+            None,
+            None,
+            Some(serde_json::json!({"_session_key": "test"})),
+            Some(Arc::new(registry)),
+        )
+        .await
+        .unwrap();
+
+        // The agent still completes — the redacted result is fed to the LLM.
+        assert_eq!(result.text, "Done!");
+        assert_eq!(result.tool_calls_made, 1);
     }
 }
