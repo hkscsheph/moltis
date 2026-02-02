@@ -953,7 +953,7 @@
 
   /* ── Tailscale status bar ── */
 
-  .ts-status-bar {
+  .info-bar {
     display: flex;
     align-items: center;
     gap: 24px;
@@ -966,31 +966,31 @@
     width: fit-content;
   }
 
-  .ts-status-bar .ts-field {
+  .info-bar .info-field {
     display: flex;
     align-items: center;
     gap: 6px;
   }
 
-  .ts-status-bar .ts-label {
+  .info-bar .info-label {
     color: var(--muted);
   }
 
-  .ts-status-bar .ts-value {
+  .info-bar .info-value {
     color: var(--text);
   }
 
-  .ts-status-bar .ts-value-strong {
+  .info-bar .info-value-strong {
     color: var(--text-strong);
     font-weight: 500;
   }
 
-  .ts-status-bar .ts-value-mono {
+  .info-bar .info-value-mono {
     color: var(--text);
     font-family: var(--font-mono);
   }
 
-  .ts-status-bar .ts-version {
+  .info-bar .info-version {
     font-family: var(--font-mono);
     font-size: 0.72rem;
     color: var(--muted);

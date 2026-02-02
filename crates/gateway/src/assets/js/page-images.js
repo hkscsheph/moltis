@@ -192,10 +192,12 @@ function SandboxBanner() {
 	var badgeColor =
 		info.backend === "none" ? "var(--error)" : info.backend === "apple-container" ? "var(--accent)" : "var(--muted)";
 
-	return html`<div style="max-width:600px;">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
-      <span class="text-xs font-medium text-[var(--text)]">Container backend:</span>
-      <span class="text-xs font-medium" style="color:${badgeColor};font-family:var(--font-mono);">${label}</span>
+	return html`<div>
+    <div class="info-bar" style="margin-bottom:8px;">
+      <span class="info-field">
+        <span class="info-label">Container backend:</span>
+        <span class="info-value-strong" style="color:${badgeColor};font-family:var(--font-mono)">${label}</span>
+      </span>
     </div>
     ${
 			rec &&
@@ -290,7 +292,7 @@ function ImagesPage() {
           ${pruning.value ? "Pruning\u2026" : "Prune all"}
         </button>
       </div>
-      <p class="text-xs text-[var(--muted)] leading-relaxed" style="max-width:600px;margin:0;">
+      <p class="text-sm text-[var(--muted)] leading-relaxed" style="max-width:600px;margin:0;">
         Container images cached by moltis for sandbox execution. You can delete individual images or prune all. Build custom images from a base with apt packages.
         ${sandboxInfo.value?.backend === "apple-container" && html`<br /><br />Apple Container provides VM-isolated execution but does not support building images. Docker (or OrbStack) is required alongside Apple Container to build and cache custom images. Sandboxed commands run via Apple Container; image builds use Docker.`}
       </p>
