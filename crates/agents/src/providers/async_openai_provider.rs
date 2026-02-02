@@ -25,9 +25,10 @@ pub struct AsyncOpenAiProvider {
 }
 
 impl AsyncOpenAiProvider {
-    pub fn new(api_key: String, model: String, base_url: String) -> Self {
+    pub fn new(api_key: secrecy::Secret<String>, model: String, base_url: String) -> Self {
+        use secrecy::ExposeSecret;
         let config = OpenAIConfig::new()
-            .with_api_key(&api_key)
+            .with_api_key(api_key.expose_secret())
             .with_api_base(&base_url);
         Self {
             model,

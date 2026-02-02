@@ -15,14 +15,13 @@ pub struct GenaiProvider {
 impl GenaiProvider {
     /// Create a new `GenaiProvider` with an explicit API key passed via
     /// `AuthResolver`, avoiding the need to set environment variables.
-    pub fn new(model: String, provider_name: String, api_key: String) -> Self {
+    pub fn new(model: String, provider_name: String, api_key: secrecy::Secret<String>) -> Self {
+        use secrecy::ExposeSecret;
+        // Expose the secret once to hand it to genai's auth resolver.
+        let key = api_key.expose_secret().clone();
         let client = genai::Client::builder()
             .with_auth_resolver(genai::resolver::AuthResolver::from_resolver_fn(
-                move |_model_iden| {
-                    Ok(Some(genai::resolver::AuthData::from_single(
-                        api_key.clone(),
-                    )))
-                },
+                move |_model_iden| Ok(Some(genai::resolver::AuthData::from_single(key.clone()))),
             ))
             .build();
         Self {

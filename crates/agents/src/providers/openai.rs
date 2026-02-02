@@ -15,9 +15,9 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, model: String, base_url: String) -> Self {
+    pub fn new(api_key: secrecy::Secret<String>, model: String, base_url: String) -> Self {
         Self {
-            api_key: secrecy::Secret::new(api_key),
+            api_key,
             model,
             base_url,
             provider_name: "openai".into(),
@@ -26,13 +26,13 @@ impl OpenAiProvider {
     }
 
     pub fn new_with_name(
-        api_key: String,
+        api_key: secrecy::Secret<String>,
         model: String,
         base_url: String,
         provider_name: String,
     ) -> Self {
         Self {
-            api_key: secrecy::Secret::new(api_key),
+            api_key,
             model,
             base_url,
             provider_name,

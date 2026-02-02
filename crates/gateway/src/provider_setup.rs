@@ -351,7 +351,7 @@ impl ProviderSetupService for LiveProviderSetupService {
             .ok_or_else(|| "missing 'apiKey' parameter".to_string())?;
 
         // Validate provider name
-        let _known = KNOWN_PROVIDERS
+        KNOWN_PROVIDERS
             .iter()
             .find(|p| p.name == provider_name && p.auth_type == "api-key")
             .ok_or_else(|| format!("unknown api-key provider: {provider_name}"))?;

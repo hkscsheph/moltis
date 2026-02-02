@@ -22,14 +22,23 @@ use {moltis_config::schema::ProvidersConfig, secrecy::ExposeSecret};
 
 use crate::model::LlmProvider;
 
-/// Resolve an API key from config (Secret) or environment variable, returning a plain String.
-fn resolve_api_key(config: &ProvidersConfig, provider: &str, env_key: &str) -> Option<String> {
+/// Resolve an API key from config (Secret) or environment variable,
+/// keeping the value wrapped in `Secret<String>` to avoid leaking it.
+fn resolve_api_key(
+    config: &ProvidersConfig,
+    provider: &str,
+    env_key: &str,
+) -> Option<secrecy::Secret<String>> {
     config
         .get(provider)
-        .and_then(|e| e.api_key.as_ref())
-        .map(|s| s.expose_secret().clone())
-        .or_else(|| std::env::var(env_key).ok())
-        .filter(|k| !k.is_empty())
+        .and_then(|e| e.api_key.clone())
+        .or_else(|| {
+            std::env::var(env_key)
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(secrecy::Secret::new)
+        })
+        .filter(|s| !s.expose_secret().is_empty())
 }
 
 /// Return the known context window size (in tokens) for a model ID.
@@ -622,7 +631,7 @@ impl ProviderRegistry {
 
             // Ollama doesn't require an API key — use a dummy value.
             let key = if def.config_name == "ollama" {
-                key.or_else(|| Some("ollama".into()))
+                key.or_else(|| Some(secrecy::Secret::new("ollama".into())))
             } else {
                 key
             };
@@ -754,6 +763,10 @@ impl ProviderRegistry {
 mod tests {
     use super::*;
 
+    fn secret(s: &str) -> secrecy::Secret<String> {
+        secrecy::Secret::new(s.into())
+    }
+
     #[test]
     fn context_window_for_known_models() {
         assert_eq!(
@@ -792,11 +805,11 @@ mod tests {
 
     #[test]
     fn provider_context_window_uses_lookup() {
-        let provider = openai::OpenAiProvider::new("k".into(), "gpt-4o".into(), "u".into());
+        let provider = openai::OpenAiProvider::new(secret("k"), "gpt-4o".into(), "u".into());
         assert_eq!(provider.context_window(), 128_000);
 
         let anthropic = anthropic::AnthropicProvider::new(
-            "k".into(),
+            secret("k"),
             "claude-sonnet-4-20250514".into(),
             "u".into(),
         );
@@ -807,7 +820,7 @@ mod tests {
     fn default_context_window_trait() {
         // OpenAiProvider with unknown model should get the fallback
         let provider =
-            openai::OpenAiProvider::new("k".into(), "unknown-model-xyz".into(), "u".into());
+            openai::OpenAiProvider::new(secret("k"), "unknown-model-xyz".into(), "u".into());
         assert_eq!(provider.context_window(), 200_000);
     }
 
@@ -891,7 +904,7 @@ mod tests {
         let initial_count = reg.list_models().len();
 
         let provider = Arc::new(openai::OpenAiProvider::new(
-            "test-key".into(),
+            secret("test-key"),
             "test-model".into(),
             "https://example.com".into(),
         ));
@@ -1067,7 +1080,7 @@ mod tests {
     #[test]
     fn provider_name_returned_by_openai_provider() {
         let provider = openai::OpenAiProvider::new_with_name(
-            "k".into(),
+            secret("k"),
             "m".into(),
             "u".into(),
             "mistral".into(),
