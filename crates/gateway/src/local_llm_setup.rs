@@ -800,6 +800,80 @@ mod tests {
     }
 
     #[test]
+    fn test_hf_api_response_parsing_real_format() {
+        // Test parsing actual HuggingFace API response format
+        // This is a real response from: https://huggingface.co/api/models?author=mlx-community&limit=1
+        let json = r#"[
+            {
+                "_id": "680fecc14cc667f59da738f5",
+                "id": "mlx-community/Qwen3-0.6B-4bit",
+                "likes": 9,
+                "private": false,
+                "downloads": 20580,
+                "tags": [
+                    "mlx",
+                    "safetensors",
+                    "qwen3",
+                    "text-generation",
+                    "conversational",
+                    "base_model:Qwen/Qwen3-0.6B",
+                    "license:apache-2.0",
+                    "4-bit",
+                    "region:us"
+                ],
+                "pipeline_tag": "text-generation",
+                "library_name": "mlx",
+                "createdAt": "2025-04-28T21:01:53.000Z",
+                "modelId": "mlx-community/Qwen3-0.6B-4bit"
+            }
+        ]"#;
+
+        // Parse as array (as the API returns)
+        let models: Vec<HfModelInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(models.len(), 1);
+
+        let info = &models[0];
+        assert_eq!(info.id, "mlx-community/Qwen3-0.6B-4bit");
+        assert_eq!(info.downloads, 20580);
+        assert_eq!(info.likes, 9);
+        assert!(info.created_at.is_some());
+        assert_eq!(info.created_at.as_ref().unwrap(), "2025-04-28T21:01:53.000Z");
+        assert!(info.tags.contains(&"mlx".to_string()));
+        assert!(info.tags.contains(&"qwen3".to_string()));
+    }
+
+    #[test]
+    fn test_hf_api_response_parsing_gguf_format() {
+        // Test parsing GGUF model response format
+        let json = r#"[
+            {
+                "id": "TheBloke/Llama-2-7B-GGUF",
+                "downloads": 5000000,
+                "likes": 500,
+                "tags": ["gguf", "llama", "text-generation"],
+                "createdAt": "2023-09-01T00:00:00.000Z"
+            },
+            {
+                "id": "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
+                "downloads": 100000,
+                "likes": 50,
+                "tags": ["gguf", "qwen", "coder"]
+            }
+        ]"#;
+
+        let models: Vec<HfModelInfo> = serde_json::from_str(json).unwrap();
+        assert_eq!(models.len(), 2);
+
+        assert_eq!(models[0].id, "TheBloke/Llama-2-7B-GGUF");
+        assert_eq!(models[0].downloads, 5000000);
+        assert!(models[0].created_at.is_some());
+
+        assert_eq!(models[1].id, "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF");
+        assert_eq!(models[1].downloads, 100000);
+        assert!(models[1].created_at.is_none()); // Not all responses have createdAt
+    }
+
+    #[test]
     fn test_custom_model_id_generation() {
         // Test that custom model IDs are generated correctly
         let repo = "TheBloke/Llama-2-7B-GGUF";
