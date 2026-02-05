@@ -3,9 +3,12 @@
 #[cfg(feature = "metrics")]
 use axum::{
     extract::State,
-    http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
+    http::StatusCode,
+    response::{IntoResponse, Json},
 };
+
+#[cfg(feature = "prometheus")]
+use axum::{http::header, response::Response};
 
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsSnapshot;
@@ -19,7 +22,7 @@ use crate::server::AppState;
 /// by Prometheus, Victoria Metrics, or other compatible collectors.
 ///
 /// This endpoint is unauthenticated to allow metric scrapers to access it.
-#[cfg(feature = "metrics")]
+#[cfg(feature = "prometheus")]
 pub async fn prometheus_metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let metrics_handle = state.gateway.metrics_handle.as_ref();
 
@@ -113,20 +116,19 @@ pub async fn api_metrics_summary_handler(State(state): State<AppState>) -> impl 
     }
 }
 
-/// Time series data for charts.
+/// Historical metrics data for time-series charts.
 ///
-/// Returns historical metric data points for rendering charts in the UI.
-/// Note: This is a placeholder - actual time series would require a storage
-/// backend or querying Prometheus directly.
+/// Returns the last hour of metrics snapshots (sampled every 10 seconds)
+/// for rendering charts in the monitoring UI.
 #[cfg(feature = "metrics")]
-pub async fn api_metrics_timeseries_handler(State(_state): State<AppState>) -> impl IntoResponse {
-    // For now, return a placeholder response.
-    // In a full implementation, this would either:
-    // 1. Query a Prometheus instance directly
-    // 2. Maintain an internal ring buffer of metric snapshots
-    // 3. Use the chartjs-plugin-datasource-prometheus on the frontend
+pub async fn api_metrics_history_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let history = state.gateway.metrics_history.read().await;
+    let points: Vec<_> = history.iter().collect();
+
     Json(serde_json::json!({
-        "note": "Time series data requires Prometheus backend or internal buffering",
-        "recommendation": "Use chartjs-plugin-datasource-prometheus to query Prometheus directly from the frontend"
+        "enabled": true,
+        "interval_seconds": 10,
+        "max_points": 360,
+        "points": points,
     }))
 }

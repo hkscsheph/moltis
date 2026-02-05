@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -10,7 +10,62 @@ use std::{
 #[cfg(feature = "metrics")]
 use moltis_metrics::MetricsHandle;
 
+// Re-export for use by other modules
+#[cfg(feature = "metrics")]
+pub use moltis_metrics::{MetricsHistoryPoint, MetricsStore, ProviderTokens, SqliteMetricsStore};
+
 use tokio::sync::{RwLock, mpsc, oneshot};
+
+// ── Metrics history ──────────────────────────────────────────────────────────
+
+/// Ring buffer for storing metrics history.
+#[cfg(feature = "metrics")]
+pub struct MetricsHistory {
+    points: VecDeque<MetricsHistoryPoint>,
+    max_points: usize,
+}
+
+#[cfg(feature = "metrics")]
+impl MetricsHistory {
+    /// Create a new history buffer with the given capacity.
+    /// Default: 360 points = 1 hour at 10-second intervals.
+    pub fn new(max_points: usize) -> Self {
+        Self {
+            points: VecDeque::with_capacity(max_points),
+            max_points,
+        }
+    }
+
+    /// Add a new data point, evicting the oldest if at capacity.
+    pub fn push(&mut self, point: MetricsHistoryPoint) {
+        if self.points.len() >= self.max_points {
+            self.points.pop_front();
+        }
+        self.points.push_back(point);
+    }
+
+    /// Iterate over all stored points (oldest to newest).
+    pub fn iter(&self) -> impl Iterator<Item = &MetricsHistoryPoint> {
+        self.points.iter()
+    }
+}
+
+#[cfg(feature = "metrics")]
+impl Default for MetricsHistory {
+    fn default() -> Self {
+        Self::new(60480) // 7 days at 10-second intervals
+    }
+}
+
+/// Broadcast payload for metrics updates via WebSocket.
+#[cfg(feature = "metrics")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MetricsUpdatePayload {
+    /// Current metrics snapshot.
+    pub snapshot: moltis_metrics::MetricsSnapshot,
+    /// Latest history point for charts.
+    pub point: MetricsHistoryPoint,
+}
 
 use moltis_protocol::ConnectParams;
 
@@ -197,6 +252,12 @@ pub struct GatewayState {
     /// Metrics handle for Prometheus export (None if metrics disabled).
     #[cfg(feature = "metrics")]
     pub metrics_handle: Option<MetricsHandle>,
+    /// Historical metrics data for time-series charts (in-memory cache).
+    #[cfg(feature = "metrics")]
+    pub metrics_history: RwLock<MetricsHistory>,
+    /// Persistent metrics store (SQLite or other backend).
+    #[cfg(feature = "metrics")]
+    pub metrics_store: Option<Arc<dyn MetricsStore>>,
 }
 
 impl GatewayState {
@@ -217,6 +278,8 @@ impl GatewayState {
             None,
             None,
             18789,
+            #[cfg(feature = "metrics")]
+            None,
             #[cfg(feature = "metrics")]
             None,
         )
@@ -242,6 +305,8 @@ impl GatewayState {
             18789,
             #[cfg(feature = "metrics")]
             None,
+            #[cfg(feature = "metrics")]
+            None,
         )
     }
 
@@ -259,6 +324,7 @@ impl GatewayState {
         memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>>,
         port: u16,
         #[cfg(feature = "metrics")] metrics_handle: Option<MetricsHandle>,
+        #[cfg(feature = "metrics")] metrics_store: Option<Arc<dyn MetricsStore>>,
     ) -> Arc<Self> {
         let hostname = hostname::get()
             .ok()
@@ -294,6 +360,10 @@ impl GatewayState {
             run_errors: RwLock::new(HashMap::new()),
             #[cfg(feature = "metrics")]
             metrics_handle,
+            #[cfg(feature = "metrics")]
+            metrics_history: RwLock::new(MetricsHistory::default()),
+            #[cfg(feature = "metrics")]
+            metrics_store,
         })
     }
 

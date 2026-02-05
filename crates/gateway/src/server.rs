@@ -86,7 +86,7 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
         .route("/ws", get(ws_upgrade_handler));
 
     // Add Prometheus metrics endpoint (unauthenticated for scraping).
-    #[cfg(feature = "metrics")]
+    #[cfg(feature = "prometheus")]
     {
         router = router.route(
             "/metrics",
@@ -161,8 +161,8 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
                 get(crate::metrics_routes::api_metrics_summary_handler),
             )
             .route(
-                "/api/metrics/timeseries",
-                get(crate::metrics_routes::api_metrics_timeseries_handler),
+                "/api/metrics/history",
+                get(crate::metrics_routes::api_metrics_history_handler),
             );
 
         let protected = protected.layer(axum::middleware::from_fn_with_state(
@@ -1097,6 +1097,25 @@ pub async fn start_gateway(
         }
     };
 
+    // Initialize metrics store for persistence.
+    #[cfg(feature = "metrics")]
+    let metrics_store: Option<Arc<dyn crate::state::MetricsStore>> = {
+        let metrics_db_path = data_dir.join("metrics.db");
+        match moltis_metrics::SqliteMetricsStore::new(&metrics_db_path).await {
+            Ok(store) => {
+                info!(
+                    "Metrics history store initialized at {}",
+                    metrics_db_path.display()
+                );
+                Some(Arc::new(store))
+            },
+            Err(e) => {
+                warn!("Failed to initialize metrics store: {e}");
+                None
+            },
+        }
+    };
+
     let state = GatewayState::with_options(
         resolved_auth,
         services,
@@ -1111,6 +1130,8 @@ pub async fn start_gateway(
         port,
         #[cfg(feature = "metrics")]
         metrics_handle,
+        #[cfg(feature = "metrics")]
+        metrics_store.clone(),
     );
 
     // Generate a one-time setup code if setup is pending and auth is not disabled.
@@ -1496,6 +1517,136 @@ pub async fn start_gateway(
             broadcast_tick(&tick_state).await;
         }
     });
+
+    // Spawn metrics history collection and broadcast task (every 10 seconds).
+    #[cfg(feature = "metrics")]
+    {
+        let metrics_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            // Load history from persistent store on startup.
+            if let Some(ref store) = metrics_state.metrics_store {
+                // Load last 7 days of history (max points for charts).
+                let seven_days_ago = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64
+                    - (7 * 24 * 60 * 60 * 1000);
+                match store.load_history(seven_days_ago, 60480).await {
+                    Ok(points) => {
+                        let mut history = metrics_state.metrics_history.write().await;
+                        for point in points {
+                            history.push(point);
+                        }
+                        info!(
+                            "Loaded {} historical metrics points from store",
+                            history.iter().count()
+                        );
+                    },
+                    Err(e) => {
+                        warn!("Failed to load metrics history: {e}");
+                    },
+                }
+            }
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut cleanup_counter = 0u32;
+            loop {
+                interval.tick().await;
+                if let Some(ref handle) = metrics_state.metrics_handle {
+                    let prometheus_text = handle.render();
+                    let snapshot =
+                        moltis_metrics::MetricsSnapshot::from_prometheus_text(&prometheus_text);
+                    // Convert per-provider metrics to history format.
+                    let by_provider = snapshot
+                        .categories
+                        .llm
+                        .by_provider
+                        .iter()
+                        .map(|(name, metrics)| {
+                            (name.clone(), moltis_metrics::ProviderTokens {
+                                input_tokens: metrics.input_tokens,
+                                output_tokens: metrics.output_tokens,
+                                completions: metrics.completions,
+                                errors: metrics.errors,
+                            })
+                        })
+                        .collect();
+
+                    let point = crate::state::MetricsHistoryPoint {
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                        llm_completions: snapshot.categories.llm.completions_total,
+                        llm_input_tokens: snapshot.categories.llm.input_tokens,
+                        llm_output_tokens: snapshot.categories.llm.output_tokens,
+                        llm_errors: snapshot.categories.llm.errors,
+                        by_provider,
+                        http_requests: snapshot.categories.http.total,
+                        http_active: snapshot.categories.http.active,
+                        ws_connections: snapshot.categories.websocket.total,
+                        ws_active: snapshot.categories.websocket.active,
+                        tool_executions: snapshot.categories.tools.total,
+                        tool_errors: snapshot.categories.tools.errors,
+                        mcp_calls: snapshot.categories.mcp.total,
+                        active_sessions: snapshot.categories.system.active_sessions,
+                    };
+
+                    // Push to in-memory history.
+                    metrics_state
+                        .metrics_history
+                        .write()
+                        .await
+                        .push(point.clone());
+
+                    // Persist to store if available.
+                    if let Some(ref store) = metrics_state.metrics_store
+                        && let Err(e) = store.save_point(&point).await
+                    {
+                        warn!("Failed to persist metrics point: {e}");
+                    }
+
+                    // Broadcast metrics update to all connected clients.
+                    let payload = crate::state::MetricsUpdatePayload { snapshot, point };
+                    if let Ok(payload_json) = serde_json::to_value(&payload) {
+                        crate::broadcast::broadcast(
+                            &metrics_state,
+                            "metrics.update",
+                            payload_json,
+                            crate::broadcast::BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    }
+
+                    // Cleanup old data once per hour (360 ticks at 10s interval).
+                    cleanup_counter += 1;
+                    if cleanup_counter >= 360 {
+                        cleanup_counter = 0;
+                        if let Some(ref store) = metrics_state.metrics_store {
+                            // Keep 7 days of history.
+                            let cutoff = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64
+                                - (7 * 24 * 60 * 60 * 1000);
+                            match store.cleanup_before(cutoff).await {
+                                Ok(deleted) if deleted > 0 => {
+                                    info!("Cleaned up {} old metrics points", deleted);
+                                },
+                                Err(e) => {
+                                    warn!("Failed to cleanup old metrics: {e}");
+                                },
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn sandbox event broadcast task: forwards provision events to WS clients.
     {

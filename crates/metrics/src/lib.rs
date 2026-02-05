@@ -23,6 +23,8 @@
 mod definitions;
 mod recorder;
 mod snapshot;
+#[cfg(feature = "sqlite")]
+mod store;
 pub mod tracing_integration;
 
 pub use {
@@ -30,6 +32,9 @@ pub use {
     recorder::{MetricsHandle, MetricsRecorderConfig, init_metrics},
     snapshot::{MetricSnapshot, MetricType, MetricsSnapshot},
 };
+
+#[cfg(feature = "sqlite")]
+pub use store::{MetricsHistoryPoint, MetricsStore, ProviderTokens, SqliteMetricsStore};
 
 // Re-export metrics macros for convenience
 pub use metrics::{counter, gauge, histogram};

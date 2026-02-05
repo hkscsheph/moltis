@@ -127,7 +127,9 @@ the use case. Duplicating styles (e.g. a second green-button class) leads to
 drift — consolidate instead.
 
 **Building Tailwind**: After adding or changing Tailwind utility classes in JS
-or HTML files, you must rebuild the CSS:
+or HTML files, you **MUST** rebuild the CSS for the changes to take effect.
+Tailwind only generates CSS for classes it finds in the source files at build
+time — new classes won't work until CSS is rebuilt:
 
 ```bash
 cd crates/gateway/ui
@@ -136,6 +138,8 @@ npx tailwindcss -i input.css -o ../src/assets/style.css --minify
 ```
 
 Use `npm run watch` during development for automatic rebuilds on file changes.
+If styles don't appear after adding new Tailwind classes, this rebuild step was
+likely missed.
 ### Server-Injected Data (gon pattern)
 
 When the frontend needs server-side data **at page load** (before any async

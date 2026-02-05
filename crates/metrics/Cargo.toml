@@ -1,8 +1,8 @@
 [package]
+description       = "Metrics collection and export for moltis"
 edition.workspace = true
 name              = "moltis-metrics"
 version.workspace = true
-description       = "Metrics collection and export for moltis"
 
 [dependencies]
 # Metrics facade (always available for no-op when disabled)
@@ -18,20 +18,27 @@ tracing-subscriber      = { features = ["env-filter"], optional = true, version 
 # For histogram buckets and utilities
 once_cell = "1"
 
+# For async trait
+async-trait = "0.1"
+
+# SQLite storage (optional)
+sqlx = { optional = true, workspace = true }
+
 # Shared dependencies
-anyhow    = { workspace = true }
-serde     = { workspace = true }
+anyhow     = { workspace = true }
+serde      = { workspace = true }
 serde_json = { workspace = true }
-tokio     = { workspace = true }
-tracing   = { workspace = true }
+tokio      = { workspace = true }
+tracing    = { workspace = true }
 
 [features]
 default    = []
 prometheus = ["dep:metrics-exporter-prometheus"]
+sqlite     = ["dep:sqlx"]
 tracing    = ["dep:metrics-tracing-context", "dep:tracing-subscriber"]
 
 [dev-dependencies]
-tokio = { features = ["rt-multi-thread", "macros"], workspace = true }
+tokio = { features = ["macros", "rt-multi-thread"], workspace = true }
 
 [lints]
 workspace = true
