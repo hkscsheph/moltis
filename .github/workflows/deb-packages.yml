@@ -261,7 +261,7 @@ jobs:
           cat > "$PKG_DIR/.PKGINFO" <<PKGINFO
           pkgname = moltis
           pkgver = ${VERSION}-1
-          pkgdesc = Rust version of moltbot
+          pkgdesc = Personal AI gateway inspired by OpenClaw
           url = https://www.moltis.org/
           arch = $MATRIX_ARCH
           license = MIT

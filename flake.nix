@@ -1,5 +1,5 @@
 {
-  description = "Moltis - Rust version of moltbot";
+  description = "Moltis - Personal AI gateway inspired by OpenClaw";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -20,7 +20,7 @@
           cargoLock.lockFile = ./Cargo.lock;
 
           meta = with pkgs.lib; {
-            description = "Rust version of moltbot";
+            description = "Personal AI gateway inspired by OpenClaw";
             homepage = "https://www.moltis.org/";
             license = licenses.mit;
             mainProgram = "moltis";

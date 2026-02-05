@@ -53,7 +53,7 @@ arch-pkg: build-release
     cat > "$PKG_DIR/.PKGINFO" <<PKGINFO
     pkgname = moltis
     pkgver = ${VERSION}-1
-    pkgdesc = Rust version of moltbot
+    pkgdesc = Personal AI gateway inspired by OpenClaw
     url = https://www.moltis.org/
     arch = ${ARCH}
     license = MIT
@@ -76,7 +76,7 @@ arch-pkg-x86_64:
     cat > "$PKG_DIR/.PKGINFO" <<PKGINFO
     pkgname = moltis
     pkgver = ${VERSION}-1
-    pkgdesc = Rust version of moltbot
+    pkgdesc = Personal AI gateway inspired by OpenClaw
     url = https://www.moltis.org/
     arch = x86_64
     license = MIT
@@ -99,7 +99,7 @@ arch-pkg-aarch64:
     cat > "$PKG_DIR/.PKGINFO" <<PKGINFO
     pkgname = moltis
     pkgver = ${VERSION}-1
-    pkgdesc = Rust version of moltbot
+    pkgdesc = Personal AI gateway inspired by OpenClaw
     url = https://www.moltis.org/
     arch = aarch64
     license = MIT

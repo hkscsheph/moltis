@@ -1,5 +1,5 @@
 [package]
-description       = "Rust version of moltbot"
+description       = "Personal AI gateway inspired by OpenClaw"
 edition.workspace = true
 homepage          = "https://www.moltis.org/"
 license           = "MIT"
@@ -25,7 +25,7 @@ section    = "net"
 assets  = [{ dest = "/usr/bin/moltis", mode = "0755", source = "target/release/moltis" }]
 license = "MIT"
 name    = "moltis"
-summary = "Rust version of moltbot"
+summary = "Personal AI gateway inspired by OpenClaw"
 url     = "https://www.moltis.org/"
 
 [[bin]]
