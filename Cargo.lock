@@ -3077,6 +3077,7 @@ dependencies = [
  "moltis-plugins",
  "moltis-projects",
  "moltis-protocol",
+ "moltis-qmd",
  "moltis-routing",
  "moltis-sessions",
  "moltis-skills",
@@ -3150,6 +3151,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "directories",
  "llama-cpp-2",
  "moltis-agents",
@@ -3272,6 +3274,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "moltis-qmd"
+version = "0.1.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "moltis-memory",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
