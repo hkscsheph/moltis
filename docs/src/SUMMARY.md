@@ -22,6 +22,7 @@
 - [Session State](session-state.md)
 - [Session Branching](session-branching.md)
 - [Skill Self-Extension](skill-tools.md)
+- [Mobile PWA](mobile-pwa.md)
 
 ---
 
